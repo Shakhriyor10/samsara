@@ -7,10 +7,10 @@ After=network-online.target
 Type=simple
 User=samsara
 Group=samsara
-WorkingDirectory=/opt/samsara/app
+WorkingDirectory=/var/www/samsara
 EnvironmentFile=/etc/samsara-bot.env
 Environment=PYTHONDONTWRITEBYTECODE=1
-ExecStart=/opt/samsara/venv/bin/python -u /opt/samsara/app/main.py
+ExecStart=/var/www/samsara/.venv/bin/python -u /var/www/samsara/main.py
 Restart=on-failure
 RestartSec=5
 UMask=0077

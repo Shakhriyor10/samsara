@@ -25,6 +25,73 @@ WEB_ROOT = Path(__file__).parent / "webapp"
 INIT_DATA_MAX_AGE_SECONDS = 24 * 60 * 60
 ACTIVE_EVENT_SENDS: set[tuple[int, str, str, str]] = set()
 PTI_PHOTO_SLOTS = ("front", "rear", "driver_side", "passenger_side", "cabin", "dashboard")
+PTI_PHOTO_RETENTION_DAYS = 15
+
+
+def cleanup_expired_pti_photos(core) -> int:
+    """Delete PTI image files and photo references older than the retention window."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=PTI_PHOTO_RETENTION_DAYS)).isoformat(
+        timespec="seconds"
+    ).replace("+00:00", "Z")
+    photo_root = (Path(core_state_path(core)) / "pti_uploads").resolve()
+    if not photo_root.exists():
+        return 0
+
+    with sqlite3.connect(core.STATE_DB) as conn:
+        expired = conn.execute(
+            "SELECT p.submission_id,p.slot,p.file_path FROM pti_photos p "
+            "JOIN pti_submissions s ON s.id=p.submission_id "
+            "WHERE julianday(s.submitted_at) <= julianday(?)",
+            (cutoff,),
+        ).fetchall()
+        deleted = 0
+        for submission_id, slot, filename in expired:
+            path = (photo_root / filename).resolve()
+            if path.parent != photo_root:
+                logger.error("Skipping PTI cleanup for unsafe photo path %r", filename)
+                continue
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                logger.exception("Could not delete expired PTI photo %s", filename)
+                continue
+            conn.execute(
+                "DELETE FROM pti_photos WHERE submission_id=? AND slot=?",
+                (submission_id, slot),
+            )
+            deleted += 1
+        if deleted:
+            conn.commit()
+    if deleted:
+        logger.info("Removed %s expired PTI photo(s) past %s days", deleted, PTI_PHOTO_RETENTION_DAYS)
+    return deleted
+
+
+async def pti_photo_retention_worker(app: web.Application) -> None:
+    while True:
+        try:
+            await asyncio.to_thread(cleanup_expired_pti_photos, app["core"])
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("PTI photo retention cleanup failed")
+        await asyncio.sleep(60 * 60)
+
+
+async def start_pti_photo_retention(app: web.Application) -> None:
+    app["pti_photo_retention_task"] = asyncio.create_task(pti_photo_retention_worker(app))
+
+
+async def stop_pti_photo_retention(app: web.Application) -> None:
+    task = app.get("pti_photo_retention_task")
+    if task is not None:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
 def ensure_pti_schema(core) -> None:
     with sqlite3.connect(core.STATE_DB) as conn:
         conn.execute(
@@ -640,6 +707,16 @@ async def api_pti_photo(request: web.Request) -> web.StreamResponse:
             "ON s.id=p.submission_id WHERE p.submission_id=? AND p.slot=?", (submission_id, slot)
         ).fetchone()
     if row is None:
+        with sqlite3.connect(core.STATE_DB) as conn:
+            submission = conn.execute(
+                "SELECT submitted_at FROM pti_submissions WHERE id=?", (submission_id,)
+            ).fetchone()
+        if submission:
+            submitted_at = datetime.fromisoformat(submission[0].replace("Z", "+00:00"))
+            if submitted_at.tzinfo is None:
+                submitted_at = submitted_at.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) - submitted_at >= timedelta(days=PTI_PHOTO_RETENTION_DAYS):
+                raise web.HTTPGone(text="PTI photos are kept for 15 days and have expired")
         raise web.HTTPNotFound(text="PTI photo not found")
     if role != "admin" and int(row[1]) != int(user["id"]):
         raise web.HTTPForbidden(text="You cannot view another driver's PTI photo")
@@ -648,6 +725,8 @@ async def api_pti_photo(request: web.Request) -> web.StreamResponse:
     photo_dir = (Path(core_state_path(core)) / "pti_uploads").resolve()
     path = (photo_dir / row[0]).resolve()
     if path.parent != photo_dir or not path.is_file():
+        if path.parent == photo_dir and not path.exists():
+            raise web.HTTPGone(text="PTI photo is no longer available; photos are kept for 15 days")
         raise web.HTTPNotFound(text="PTI photo file is unavailable")
     return web.FileResponse(path, headers={"Cache-Control": "private, no-store"})
 
@@ -1078,6 +1157,8 @@ def create_app(bot: Bot, core) -> web.Application:
     app = web.Application(client_max_size=32 * 1024 * 1024)
     app["bot"] = bot
     app["core"] = core
+    app.on_startup.append(start_pti_photo_retention)
+    app.on_cleanup.append(stop_pti_photo_retention)
     app.router.add_get("/", index)
     app.router.add_get("/api/me", api_me)
     app.router.add_get("/api/trucks", api_trucks)

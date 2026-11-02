@@ -3,7 +3,8 @@ set -euo pipefail
 
 DOMAIN="baw-sam.uz"
 EXPECTED_IPV4="77.83.206.140"
-APP_DIR="/opt/samsara/app"
+APP_DIR="/var/www/samsara"
+VENV_DIR="$APP_DIR/.venv"
 STATE_DIR="/var/lib/samsara"
 ENV_FILE="/etc/samsara-bot.env"
 
@@ -14,7 +15,7 @@ fi
 if [[ ! -f "$APP_DIR/main.py" || ! -f "$APP_DIR/miniapp_server.py" || \
       ! -f "$APP_DIR/requirements.txt" || ! -f "$APP_DIR/webapp/index.html" || \
       ! -f "$APP_DIR/deploy/nginx-baw-sam.uz.conf" || ! -f "$APP_DIR/deploy/samsara-bot.service" ]]; then
-  echo "Upload main.py, requirements.txt, webapp/, and deploy/ to $APP_DIR first." >&2
+  echo "The project files, webapp/, and deploy/ must be present in $APP_DIR." >&2
   exit 1
 fi
 if [[ ! -f "$ENV_FILE" && ! -f "$APP_DIR/.env" ]]; then
@@ -77,10 +78,13 @@ chmod 0640 "$ENV_FILE"
 chown -R root:samsara "$APP_DIR"
 find "$APP_DIR" -type d -exec chmod 0750 {} +
 find "$APP_DIR" -type f -exec chmod 0640 {} +
+if [[ ! -x "$VENV_DIR/bin/python" ]]; then
+  python3 -m venv "$VENV_DIR"
+fi
+find "$VENV_DIR/bin" -maxdepth 1 -type f -exec chmod 0750 {} +
 chown -R samsara:samsara "$STATE_DIR"
 
-python3 -m venv /opt/samsara/venv
-"/opt/samsara/venv/bin/pip" install --disable-pip-version-check -r "$APP_DIR/requirements.txt"
+"$VENV_DIR/bin/python" -m pip install --disable-pip-version-check -r "$APP_DIR/requirements.txt"
 
 NGINX_SITE="/etc/nginx/sites-available/samsara-bot"
 DOMAIN_PATTERN='server_name[^;]*([[:space:]]|^)baw-sam[.]uz([[:space:];]|$)'
