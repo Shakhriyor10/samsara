@@ -8,6 +8,7 @@
 *.pyc
 __pycache__/
 local_settings.py
+*.sqlite3
 db.sqlite3
 db.sqlite3-journal
 media
@@ -124,6 +125,7 @@ celerybeat.pid
 # .env
 .env
 .env/
+pti_uploads/
 .venv/
 env/
 venv/
