@@ -126,6 +126,7 @@ celerybeat.pid
 .env
 .env/
 pti_uploads/
+event_video_cache/
 .venv/
 env/
 venv/

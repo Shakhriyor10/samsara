@@ -8,6 +8,7 @@ import hmac
 import html
 import json
 import logging
+import os
 import sqlite3
 import time
 import uuid
@@ -26,6 +27,9 @@ INIT_DATA_MAX_AGE_SECONDS = 24 * 60 * 60
 ACTIVE_EVENT_SENDS: set[tuple[int, str, str, str]] = set()
 PTI_PHOTO_SLOTS = ("front", "rear", "driver_side", "passenger_side", "cabin", "dashboard")
 PTI_PHOTO_RETENTION_DAYS = 15
+EVENT_VIDEO_CACHE_DAYS = 6
+EVENT_VIDEO_CACHE_TASKS: dict[str, asyncio.Task] = {}
+EVENT_VIDEO_CACHE_RETRY_AFTER: dict[str, float] = {}
 
 
 def cleanup_expired_pti_photos(core) -> int:
@@ -67,23 +71,158 @@ def cleanup_expired_pti_photos(core) -> int:
     return deleted
 
 
-async def pti_photo_retention_worker(app: web.Application) -> None:
+def event_video_cache_root(core) -> Path:
+    return Path(core_state_path(core)) / "event_video_cache"
+
+
+def event_video_cache_key(account_id: str, vehicle_id: str, event_id: str, event_date: str) -> str:
+    raw = "\x1f".join((account_id, vehicle_id, event_id, event_date))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def find_cached_event_video(core, cache_key: str) -> Path | None:
+    root = event_video_cache_root(core)
+    now_epoch = datetime.now(timezone.utc).timestamp()
+    cutoff_epoch = now_epoch - EVENT_VIDEO_CACHE_DAYS * 24 * 60 * 60
+    for path in root.glob(f"*_{cache_key}.mp4"):
+        try:
+            event_epoch = int(path.name.split("_", 1)[0])
+        except (ValueError, IndexError):
+            path.unlink(missing_ok=True)
+            continue
+        if event_epoch < cutoff_epoch or event_epoch > now_epoch + 300:
+            path.unlink(missing_ok=True)
+            continue
+        return path
+    return None
+
+
+def cleanup_expired_event_videos(core) -> int:
+    root = event_video_cache_root(core)
+    if not root.exists():
+        return 0
+    cutoff_epoch = int(datetime.now(timezone.utc).timestamp() - EVENT_VIDEO_CACHE_DAYS * 24 * 60 * 60)
+    deleted = 0
+    for path in root.iterdir():
+        if not path.is_file():
+            continue
+        if path.suffix != ".mp4":
+            try:
+                if datetime.now(timezone.utc).timestamp() - path.stat().st_mtime > 86400:
+                    path.unlink(missing_ok=True)
+                    deleted += 1
+            except OSError:
+                logger.warning("Could not remove stale video-cache temporary file %s", path, exc_info=True)
+            continue
+        try:
+            event_epoch = int(path.name.split("_", 1)[0])
+        except (ValueError, IndexError):
+            continue
+        if event_epoch < cutoff_epoch:
+            try:
+                path.unlink(missing_ok=True)
+                deleted += 1
+            except OSError:
+                logger.warning("Could not remove expired cached event video %s", path, exc_info=True)
+    if deleted:
+        logger.info("Removed %s expired safety video cache file(s)", deleted)
+    return deleted
+
+
+async def store_event_video_cache(core, cache_key: str, event_timestamp: datetime, content: bytes) -> Path:
+    root = event_video_cache_root(core)
+    await asyncio.to_thread(root.mkdir, parents=True, exist_ok=True)
+    await asyncio.to_thread(os.chmod, root, 0o700)
+    event_epoch = int(event_timestamp.astimezone(timezone.utc).timestamp())
+    target = root / f"{event_epoch}_{cache_key}.mp4"
+    temporary = root / f"{event_epoch}_{cache_key}.part"
+
+    def write_atomic() -> None:
+        temporary.write_bytes(content)
+        os.chmod(temporary, 0o600)
+        temporary.replace(target)
+
+    await asyncio.to_thread(write_atomic)
+    return target
+
+
+async def prewarm_event_video(app: web.Application, account, event: dict) -> None:
+    core = app["core"]
+    stamp = core.event_timestamp(event)
+    vehicle_id = event_vehicle_id(core, event)
+    event_id = core.event_id(event)
+    if not stamp or not vehicle_id or not event_id:
+        return
+    now = datetime.now(timezone.utc)
+    stamp = stamp.astimezone(timezone.utc)
+    if not now - timedelta(days=EVENT_VIDEO_CACHE_DAYS) <= stamp <= now + timedelta(minutes=5):
+        return
+    event_date = stamp.astimezone(core.ZoneInfo(core.EVENT_TIMEZONE)).date().isoformat()
+    cache_key = event_video_cache_key(account.account_id, vehicle_id, event_id, event_date)
+    if find_cached_event_video(core, cache_key):
+        return
+    semaphore: asyncio.Semaphore = app["event_video_cache_semaphore"]
+    async with semaphore:
+        if find_cached_event_video(core, cache_key):
+            return
+        try:
+            content = await prepare_event_video(core, event, account)
+            await store_event_video_cache(core, cache_key, stamp, content)
+            EVENT_VIDEO_CACHE_RETRY_AFTER.pop(cache_key, None)
+            logger.info("Pre-cached safety-event video %s for Alerts", event_id)
+        except Exception:
+            EVENT_VIDEO_CACHE_RETRY_AFTER[cache_key] = asyncio.get_running_loop().time() + 30 * 60
+            logger.info("Could not pre-cache safety-event video %s; it will load on demand", event_id, exc_info=True)
+
+
+def schedule_event_video_prewarm(app: web.Application, account, event: dict) -> None:
+    core = app["core"]
+    vehicle_id = event_vehicle_id(core, event)
+    event_id = core.event_id(event)
+    stamp = core.event_timestamp(event)
+    if not vehicle_id or not event_id or not stamp:
+        return
+    event_date = stamp.astimezone(core.ZoneInfo(core.EVENT_TIMEZONE)).date().isoformat()
+    key = event_video_cache_key(account.account_id, vehicle_id, event_id, event_date)
+    if find_cached_event_video(core, key) or key in app["event_video_cache_tasks"]:
+        return
+    retry_after = EVENT_VIDEO_CACHE_RETRY_AFTER.get(key, 0)
+    if retry_after > asyncio.get_running_loop().time():
+        return
+    EVENT_VIDEO_CACHE_RETRY_AFTER.pop(key, None)
+    task = asyncio.create_task(prewarm_event_video(app, account, event))
+    app["event_video_cache_tasks"][key] = task
+    task.add_done_callback(
+        lambda finished, cache_key=key, tasks=app["event_video_cache_tasks"]:
+        tasks.pop(cache_key, None) if tasks.get(cache_key) is finished else None
+    )
+
+
+async def media_retention_worker(app: web.Application) -> None:
     while True:
         try:
             await asyncio.to_thread(cleanup_expired_pti_photos, app["core"])
+            await asyncio.to_thread(cleanup_expired_event_videos, app["core"])
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("PTI photo retention cleanup failed")
+            logger.exception("Scheduled media retention cleanup failed")
         await asyncio.sleep(60 * 60)
 
 
-async def start_pti_photo_retention(app: web.Application) -> None:
-    app["pti_photo_retention_task"] = asyncio.create_task(pti_photo_retention_worker(app))
+async def start_media_retention(app: web.Application) -> None:
+    app["event_video_cache_tasks"] = EVENT_VIDEO_CACHE_TASKS
+    app["event_video_cache_semaphore"] = asyncio.Semaphore(2)
+    app["media_retention_task"] = asyncio.create_task(media_retention_worker(app))
 
 
-async def stop_pti_photo_retention(app: web.Application) -> None:
-    task = app.get("pti_photo_retention_task")
+async def stop_media_retention(app: web.Application) -> None:
+    video_tasks = list(app.get("event_video_cache_tasks", {}).values())
+    for video_task in video_tasks:
+        video_task.cancel()
+    if video_tasks:
+        await asyncio.gather(*video_tasks, return_exceptions=True)
+    task = app.get("media_retention_task")
     if task is not None:
         task.cancel()
         try:
@@ -941,6 +1080,7 @@ async def api_alerts(request: web.Request) -> web.Response:
             raise web.HTTPBadRequest(text="Invalid company selection")
 
     results: list[dict] = []
+    cache_candidates: dict[tuple[str, str, str, str], tuple[object, dict]] = {}
     for account in core.ACCOUNTS:
         if selected_account_id and account.account_id != selected_account_id:
             continue
@@ -963,12 +1103,20 @@ async def api_alerts(request: web.Request) -> web.Response:
             if formatted["id"]:
                 formatted["_sortTimestamp"] = stamp.timestamp()
                 results.append(formatted)
+                event_date = stamp.astimezone(core.ZoneInfo(core.EVENT_TIMEZONE)).date().isoformat()
+                cache_candidates[(account.account_id, vehicle_id, formatted["id"], event_date)] = (account, event)
 
     results.sort(key=lambda item: item["_sortTimestamp"], reverse=True)
-    for item in results:
+    visible_results = results[:500]
+    for item in visible_results:
+        candidate = cache_candidates.get(
+            (item["accountId"], item["truckId"], item["id"], item["eventDate"])
+        )
+        if candidate:
+            schedule_event_video_prewarm(request.app, *candidate)
         item.pop("_sortTimestamp", None)
     return web.json_response({
-        "events": results[:500],
+        "events": visible_results,
         "count": len(results),
         "from": from_date.isoformat(),
         "to": to_date.isoformat(),
@@ -991,6 +1139,7 @@ async def api_live_alerts(request: web.Request) -> web.Response:
     # the Mini App removes duplicates by event ID.
     start = max(since.astimezone(timezone.utc) - timedelta(minutes=10), now - timedelta(days=1))
     results: list[dict] = []
+    cache_candidates: dict[tuple[str, str, str, str], tuple[object, dict]] = {}
     for account in core.ACCOUNTS:
         try:
             events = await core.get_braking_events(account, start, now)
@@ -1006,8 +1155,15 @@ async def api_live_alerts(request: web.Request) -> web.Response:
             if item["id"]:
                 item["_sortTimestamp"] = stamp.timestamp()
                 results.append(item)
+                event_date = stamp.astimezone(core.ZoneInfo(core.EVENT_TIMEZONE)).date().isoformat()
+                cache_candidates[(account.account_id, vehicle_id, item["id"], event_date)] = (account, event)
     results.sort(key=lambda item: item["_sortTimestamp"], reverse=True)
     for item in results:
+        candidate = cache_candidates.get(
+            (item["accountId"], item["truckId"], item["id"], item["eventDate"])
+        )
+        if candidate:
+            schedule_event_video_prewarm(request.app, *candidate)
         item.pop("_sortTimestamp", None)
     return web.json_response({"events": results, "checkedAt": core.utc_iso(now)})
 
@@ -1137,10 +1293,38 @@ async def api_event_video(request: web.Request) -> web.Response:
     account = next((item for item in core.ACCOUNTS if item.account_id == account_id), None)
     if account is None:
         raise web.HTTPNotFound(text="Company not found")
+    event_date = request.query.get("date", "")
+    cache_key = event_video_cache_key(account_id, vehicle_id, selected_event_id, event_date)
+    cached_path = find_cached_event_video(core, cache_key) if event_date else None
+    pending = request.app["event_video_cache_tasks"].get(cache_key)
+    if cached_path is None and pending is not None:
+        await asyncio.shield(pending)
+        cached_path = find_cached_event_video(core, cache_key)
+    if cached_path is not None:
+        return web.FileResponse(
+            cached_path,
+            headers={
+                "Cache-Control": "private, no-store",
+                "Content-Disposition": 'inline; filename="safety-event.mp4"',
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
     event = await get_event_for_date(core, request, account, vehicle_id, selected_event_id)
     if event is None:
         raise web.HTTPNotFound(text="Safety event not found in the selected date range")
     video = await prepare_event_video(core, event, account)
+    stamp = core.event_timestamp(event)
+    if stamp and datetime.now(timezone.utc) - timedelta(days=EVENT_VIDEO_CACHE_DAYS) <= stamp.astimezone(timezone.utc) <= datetime.now(timezone.utc) + timedelta(minutes=5):
+        cache_key = event_video_cache_key(
+            account_id,
+            vehicle_id,
+            selected_event_id,
+            stamp.astimezone(core.ZoneInfo(core.EVENT_TIMEZONE)).date().isoformat(),
+        )
+        try:
+            await store_event_video_cache(core, cache_key, stamp, video)
+        except OSError:
+            logger.warning("Could not store safety-event video %s in cache", selected_event_id, exc_info=True)
     return web.Response(
         body=video,
         content_type="video/mp4",
@@ -1157,8 +1341,10 @@ def create_app(bot: Bot, core) -> web.Application:
     app = web.Application(client_max_size=32 * 1024 * 1024)
     app["bot"] = bot
     app["core"] = core
-    app.on_startup.append(start_pti_photo_retention)
-    app.on_cleanup.append(stop_pti_photo_retention)
+    app["event_video_cache_tasks"] = EVENT_VIDEO_CACHE_TASKS
+    app["event_video_cache_semaphore"] = asyncio.Semaphore(2)
+    app.on_startup.append(start_media_retention)
+    app.on_cleanup.append(stop_media_retention)
     app.router.add_get("/", index)
     app.router.add_get("/api/me", api_me)
     app.router.add_get("/api/trucks", api_trucks)
