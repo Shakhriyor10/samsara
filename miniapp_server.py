@@ -831,7 +831,8 @@ async def api_driver_activity(request: web.Request) -> web.Response:
 
 PTI_IMAGE_TYPES = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
 PTI_VIDEO_TYPES = {"video/mp4": ".mp4", "video/quicktime": ".mov", "video/webm": ".webm", "video/x-matroska": ".webm"}
-PTI_MAX_PHOTO_BYTES = 8 * 1024 * 1024
+# Full-resolution camera frames (up to 4096 px wide) at high JPEG quality.
+PTI_MAX_PHOTO_BYTES = 20 * 1024 * 1024
 PTI_MAX_VIDEO_BYTES = 150 * 1024 * 1024
 PTI_MAX_UPLOAD_BYTES = 350 * 1024 * 1024
 

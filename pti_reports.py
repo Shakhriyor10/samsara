@@ -25,6 +25,9 @@ logger = logging.getLogger("samsara_pti_reports")
 ZIP_PART_LIMIT = 48 * 1024 * 1024
 VIDEO_SUFFIXES = {".mp4", ".mov", ".webm"}
 TRANSCODE_TIMEOUT_SECONDS = 600
+VIDEO_LONG_SIDE = 1920
+# One video must fit a ZIP part on its own, with room for the report.
+VIDEO_SIZE_LIMIT = ZIP_PART_LIMIT - 2 * 1024 * 1024
 _BUILD_LOCK: asyncio.Lock | None = None
 
 
@@ -63,14 +66,9 @@ def _safe_name(value: str, limit: int = 60) -> str:
     return (cleaned or "item")[:limit]
 
 
-async def _transcode(source: Path, target: Path) -> bool:
-    """Shrink a phone recording to H.264 720p so the archive stays under Telegram's limit."""
-    longest = "1280"
-    scale = f"scale='if(gt(iw,ih),min({longest},iw),-2)':'if(gt(iw,ih),-2,min({longest},ih))'"
+async def _run_ffmpeg(args: list[str], name: str) -> bool:
     process = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-y", "-v", "error", "-i", str(source), "-vf", scale,
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "28", "-maxrate", "1500k", "-bufsize", "3000k",
-        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "64k", "-movflags", "+faststart", str(target),
+        "ffmpeg", "-y", "-v", "error", *args,
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
     )
     try:
@@ -78,12 +76,50 @@ async def _transcode(source: Path, target: Path) -> bool:
     except asyncio.TimeoutError:
         process.kill()
         await process.wait()
-        logger.warning("Timed out compressing PTI video %s", source.name)
+        logger.warning("Timed out compressing PTI video %s", name)
         return False
-    if process.returncode != 0 or not target.is_file():
-        logger.warning("Could not compress PTI video %s: %s", source.name, stderr.decode(errors="replace")[-500:])
+    if process.returncode != 0:
+        logger.warning("Could not compress PTI video %s: %s", name, stderr.decode(errors="replace")[-500:])
         return False
     return True
+
+
+async def _video_seconds(path: Path) -> float | None:
+    process = await asyncio.create_subprocess_exec(
+        "ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path),
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+    )
+    stdout, _ = await process.communicate()
+    try:
+        return float(stdout.decode().strip())
+    except ValueError:
+        return None
+
+
+async def _transcode(source: Path, target: Path) -> bool:
+    """Convert a phone recording to H.264 1080p that plays everywhere and fits one Telegram upload."""
+    scale = f"scale='if(gt(iw,ih),min({VIDEO_LONG_SIDE},iw),-2)':'if(gt(iw,ih),-2,min({VIDEO_LONG_SIDE},ih))'"
+    common = ["-vf", scale, "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart"]
+    if not await _run_ffmpeg(
+        ["-i", str(source), "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+         "-maxrate", "6000k", "-bufsize", "12000k", *common, str(target)],
+        source.name,
+    ) or not target.is_file():
+        return False
+    if target.stat().st_size <= VIDEO_SIZE_LIMIT:
+        return True
+    # Too large for one upload: re-encode at the highest bitrate that still fits.
+    seconds = await _video_seconds(target)
+    if not seconds:
+        return False
+    video_kbps = int(VIDEO_SIZE_LIMIT * 8 / seconds / 1000 * 0.95) - 128
+    if video_kbps < 300:
+        return False
+    return await _run_ffmpeg(
+        ["-i", str(source), "-c:v", "libx264", "-preset", "veryfast", "-b:v", f"{video_kbps}k",
+         "-maxrate", f"{video_kbps}k", "-bufsize", f"{video_kbps * 2}k", *common, str(target)],
+        source.name,
+    ) and target.is_file()
 
 
 def _report_text(meta: dict, items: list[dict]) -> str:

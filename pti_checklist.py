@@ -32,7 +32,7 @@ SECTIONS: list[tuple[str, str, list[dict[str, Any]]]] = [
 WALKAROUND_STEP: dict[str, Any] = {
     "key": "walkaround", "kind": "walkaround", "seconds": 90, "section": "video",
     "sectionTitle": "Walk-around video", "title": "Walk-around and cab video", "art": "front",
-    "hint": "Walk a full circle around the truck and trailer, then film the cab. Recording stops at 1:30.",
+    "hint": "Walk around the truck and trailer, then film the cab. Tap stop whenever you are done; recording ends at 1:30.",
     "phases": [
         {"title": "Walk around the truck", "seconds": 70, "hint": "Start at the front and walk a full circle around the truck and trailer."},
         {"title": "Cab", "seconds": 20, "hint": "Climb in and film the cab: dashboard, seat, safety equipment."},
