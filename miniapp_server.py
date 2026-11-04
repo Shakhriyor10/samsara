@@ -220,6 +220,9 @@ async def start_media_retention(app: web.Application) -> None:
     app["event_video_cache_tasks"] = EVENT_VIDEO_CACHE_TASKS
     app["event_video_cache_semaphore"] = asyncio.Semaphore(2)
     app["media_retention_task"] = asyncio.create_task(media_retention_worker(app))
+    pending_videos = asyncio.create_task(pti_reports.normalize_pending_videos(app["core"]))
+    app.setdefault("pti_report_tasks", set()).add(pending_videos)
+    pending_videos.add_done_callback(app["pti_report_tasks"].discard)
 
 
 async def stop_media_retention(app: web.Application) -> None:

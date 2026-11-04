@@ -30,8 +30,9 @@ VIDEO_LONG_SIDE = 1920
 HIGH_FPS = 60
 BASE_FPS = 30
 NORMALIZED_SUFFIX = "_cfr.mp4"
-# Files written by the earlier 30 fps-only version are already normalized too.
-NORMALIZED_SUFFIXES = (NORMALIZED_SUFFIX, "_30fps.mp4")
+REMUXED_STEM = "_indexed"
+# Re-encoded, remuxed, and files from the earlier 30 fps-only version are all already playable.
+NORMALIZED_SUFFIXES = (NORMALIZED_SUFFIX, "_30fps.mp4", f"{REMUXED_STEM}.mp4", f"{REMUXED_STEM}.webm")
 # One video must fit a ZIP part on its own, with room for the report.
 VIDEO_SIZE_LIMIT = ZIP_PART_LIMIT - 2 * 1024 * 1024
 _BUILD_LOCK: asyncio.Lock | None = None
@@ -129,7 +130,9 @@ async def _encode(source: Path, target: Path, fps: int, rate_args: list[str]) ->
     """
     scale = f"scale='if(gt(iw,ih),min({VIDEO_LONG_SIDE},iw),-2)':'if(gt(iw,ih),-2,min({VIDEO_LONG_SIDE},ih))'"
     return await _run_ffmpeg(
-        ["-i", str(source), "-vf", f"{scale},fps={fps}", "-fps_mode", "cfr", "-r", str(fps),
+        # The fps filter plus -r gives a constant rate on every FFmpeg release; -fps_mode needs 5.1+,
+        # newer than the ffmpeg package on Ubuntu 22.04.
+        ["-i", str(source), "-vf", f"{scale},fps={fps}", "-r", str(fps),
          "-c:v", "libx264", "-preset", "veryfast", *rate_args, "-g", str(fps * 2), "-pix_fmt", "yuv420p",
          "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-movflags", "+faststart", str(target)],
         source.name,
@@ -157,6 +160,23 @@ async def _fit_video(source: Path, target: Path) -> Path:
     return source
 
 
+def _remux_suffix(source: Path) -> str:
+    return ".webm" if source.suffix.lower() == ".webm" else ".mp4"
+
+
+async def _remux(source: Path, target: Path) -> bool:
+    """Copy the streams into a container with a proper index (MP4 with moov first, or WebM with cues)."""
+    args = ["-i", str(source), "-map", "0:v:0", "-map", "0:a?", "-c", "copy"]
+    if target.suffix == ".mp4":
+        args += ["-movflags", "+faststart"]
+    return await _run_ffmpeg([*args, str(target)], source.name) and await _is_seekable(target)
+
+
+async def _is_seekable(path: Path) -> bool:
+    """A file players can scrub through reports its duration up front."""
+    return path.is_file() and bool(await _video_seconds(path))
+
+
 async def _normalize_submission_videos(core, submission_id: str, upload_root: Path) -> None:
     """Replace each uploaded recording with a constant frame rate MP4 so the app archive and the ZIP play smoothly."""
     with sqlite3.connect(core.STATE_DB) as conn:
@@ -167,9 +187,16 @@ async def _normalize_submission_videos(core, submission_id: str, upload_root: Pa
             continue
         target_name = f"{Path(filename).stem}{NORMALIZED_SUFFIX}"
         target = upload_root / target_name
-        if not await normalize_video(source, target):
+        if not await normalize_video(source, target) or not await _is_seekable(target):
             target.unlink(missing_ok=True)
-            continue
+            # Never keep the raw browser recording: it has no seek index.
+            target_name = f"{Path(filename).stem}{REMUXED_STEM}{_remux_suffix(source)}"
+            target = upload_root / target_name
+            if not await _remux(source, target):
+                target.unlink(missing_ok=True)
+                logger.error("PTI video %s could not be re-encoded or remuxed; keeping the original", filename)
+                continue
+            logger.warning("PTI video %s could not be re-encoded; stored a remuxed copy instead", filename)
         with sqlite3.connect(core.STATE_DB) as conn:
             conn.execute(
                 "UPDATE pti_photos SET file_path=? WHERE submission_id=? AND slot=?", (target_name, submission_id, slot)
@@ -268,6 +295,33 @@ def _record(core, submission_id: str, chat_id: int | None, error: str | None) ->
             "ON CONFLICT(submission_id) DO UPDATE SET chat_id=excluded.chat_id,sent_at=excluded.sent_at,error=excluded.error",
             (submission_id, chat_id, sent_at, error),
         )
+
+
+async def normalize_pending_videos(core) -> None:
+    """Fix recordings stored before re-encoding worked on this server (e.g. older FFmpeg without -fps_mode)."""
+    global _BUILD_LOCK
+    _BUILD_LOCK = _BUILD_LOCK or asyncio.Lock()
+    upload_root = Path(core.STATE_DB).resolve().parent / "pti_uploads"
+    try:
+        with sqlite3.connect(core.STATE_DB) as conn:
+            rows = conn.execute("SELECT DISTINCT submission_id,file_path FROM pti_photos").fetchall()
+    except sqlite3.Error:
+        logger.exception("Could not look for PTI videos to re-encode")
+        return
+    pending = sorted({
+        submission_id for submission_id, filename in rows
+        if Path(filename).suffix.lower() in VIDEO_SUFFIXES and not filename.endswith(NORMALIZED_SUFFIXES)
+    })
+    for submission_id in pending:
+        try:
+            async with _BUILD_LOCK:
+                await _normalize_submission_videos(core, submission_id, upload_root)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Could not re-encode stored videos for PTI %s", submission_id)
+    if pending:
+        logger.info("Re-encoded stored videos for %s PTI submission(s)", len(pending))
 
 
 async def send_pti_report(bot: Bot, core, submission_id: str) -> None:
