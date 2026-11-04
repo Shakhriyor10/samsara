@@ -26,6 +26,8 @@ ZIP_PART_LIMIT = 48 * 1024 * 1024
 VIDEO_SUFFIXES = {".mp4", ".mov", ".webm"}
 TRANSCODE_TIMEOUT_SECONDS = 600
 VIDEO_LONG_SIDE = 1920
+VIDEO_FPS = 30
+NORMALIZED_SUFFIX = "_30fps.mp4"
 # One video must fit a ZIP part on its own, with room for the report.
 VIDEO_SIZE_LIMIT = ZIP_PART_LIMIT - 2 * 1024 * 1024
 _BUILD_LOCK: asyncio.Lock | None = None
@@ -96,30 +98,58 @@ async def _video_seconds(path: Path) -> float | None:
         return None
 
 
-async def _transcode(source: Path, target: Path) -> bool:
-    """Convert a phone recording to H.264 1080p that plays everywhere and fits one Telegram upload."""
+async def _encode(source: Path, target: Path, rate_args: list[str]) -> bool:
+    """H.264 at up to 1080p and a constant 30 fps.
+
+    Phone browsers record variable frame rate video (WebM without an index on Android); many
+    players show that as stutter, so every frame gets an even 1/30 s slot.
+    """
     scale = f"scale='if(gt(iw,ih),min({VIDEO_LONG_SIDE},iw),-2)':'if(gt(iw,ih),-2,min({VIDEO_LONG_SIDE},ih))'"
-    common = ["-vf", scale, "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart"]
-    if not await _run_ffmpeg(
-        ["-i", str(source), "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
-         "-maxrate", "6000k", "-bufsize", "12000k", *common, str(target)],
-        source.name,
-    ) or not target.is_file():
-        return False
-    if target.stat().st_size <= VIDEO_SIZE_LIMIT:
-        return True
-    # Too large for one upload: re-encode at the highest bitrate that still fits.
-    seconds = await _video_seconds(target)
-    if not seconds:
-        return False
-    video_kbps = int(VIDEO_SIZE_LIMIT * 8 / seconds / 1000 * 0.95) - 128
-    if video_kbps < 300:
-        return False
     return await _run_ffmpeg(
-        ["-i", str(source), "-c:v", "libx264", "-preset", "veryfast", "-b:v", f"{video_kbps}k",
-         "-maxrate", f"{video_kbps}k", "-bufsize", f"{video_kbps * 2}k", *common, str(target)],
+        ["-i", str(source), "-vf", f"{scale},fps={VIDEO_FPS}", "-fps_mode", "cfr", "-r", str(VIDEO_FPS),
+         "-c:v", "libx264", "-preset", "veryfast", *rate_args, "-g", str(VIDEO_FPS * 2), "-pix_fmt", "yuv420p",
+         "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-movflags", "+faststart", str(target)],
         source.name,
     ) and target.is_file()
+
+
+async def normalize_video(source: Path, target: Path) -> bool:
+    return await _encode(source, target, ["-crf", "21", "-maxrate", "6000k", "-bufsize", "12000k"])
+
+
+async def _fit_video(source: Path, target: Path) -> Path:
+    """Return a version of the video that fits one Telegram upload, re-encoding only when needed."""
+    if source.stat().st_size <= VIDEO_SIZE_LIMIT:
+        return source
+    seconds = await _video_seconds(source)
+    if seconds:
+        video_kbps = int(VIDEO_SIZE_LIMIT * 8 / seconds / 1000 * 0.95) - 128
+        if video_kbps >= 300 and await _encode(
+            source, target,
+            ["-b:v", f"{video_kbps}k", "-maxrate", f"{video_kbps}k", "-bufsize", f"{video_kbps * 2}k"],
+        ):
+            return target
+    return source
+
+
+async def _normalize_submission_videos(core, submission_id: str, upload_root: Path) -> None:
+    """Replace each uploaded recording with its 30 fps MP4 so the app archive and the ZIP play smoothly."""
+    with sqlite3.connect(core.STATE_DB) as conn:
+        rows = conn.execute("SELECT slot,file_path FROM pti_photos WHERE submission_id=?", (submission_id,)).fetchall()
+    for slot, filename in rows:
+        source = upload_root / filename
+        if Path(filename).suffix.lower() not in VIDEO_SUFFIXES or filename.endswith(NORMALIZED_SUFFIX) or not source.is_file():
+            continue
+        target_name = f"{Path(filename).stem}{NORMALIZED_SUFFIX}"
+        target = upload_root / target_name
+        if not await normalize_video(source, target):
+            target.unlink(missing_ok=True)
+            continue
+        with sqlite3.connect(core.STATE_DB) as conn:
+            conn.execute(
+                "UPDATE pti_photos SET file_path=? WHERE submission_id=? AND slot=?", (target_name, submission_id, slot)
+            )
+        source.unlink(missing_ok=True)
 
 
 def _report_text(meta: dict, items: list[dict]) -> str:
@@ -219,17 +249,18 @@ async def send_pti_report(bot: Bot, core, submission_id: str) -> None:
     global _BUILD_LOCK
     _BUILD_LOCK = _BUILD_LOCK or asyncio.Lock()
     try:
-        loaded = await asyncio.to_thread(_load_submission, core, submission_id)
-        if loaded is None:
-            return
-        meta, items, media, chat_id = loaded
-        if chat_id is None:
-            await asyncio.to_thread(_record, core, submission_id, None, "No PTI report group is configured")
-            return
         upload_root = Path(core.STATE_DB).resolve().parent / "pti_uploads"
-        files_by_slot = dict(media)
-        # One archive at a time: video compression is CPU-heavy.
+        # One submission at a time: video encoding is CPU-heavy.
         async with _BUILD_LOCK:
+            await _normalize_submission_videos(core, submission_id, upload_root)
+            loaded = await asyncio.to_thread(_load_submission, core, submission_id)
+            if loaded is None:
+                return
+            meta, items, media, chat_id = loaded
+            if chat_id is None:
+                await asyncio.to_thread(_record, core, submission_id, None, "No PTI report group is configured")
+                return
+            files_by_slot = dict(media)
             with tempfile.TemporaryDirectory(prefix="pti_report_") as workdir:
                 work = Path(workdir)
                 packed: list[tuple[Path, str]] = []
@@ -243,9 +274,7 @@ async def send_pti_report(bot: Bot, core, submission_id: str) -> None:
                         continue
                     suffix = source.suffix.lower()
                     if suffix in VIDEO_SUFFIXES:
-                        compressed = work / f"{item['key']}.mp4"
-                        if await _transcode(source, compressed):
-                            source, suffix = compressed, ".mp4"
+                        source = await _fit_video(source, work / f"{item['key']}.mp4")
                     folder = f"{section_numbers[item['sectionTitle']]:02d}_{_safe_name(item['sectionTitle'])}"
                     arcname = f"{folder}/{number:02d}_{_safe_name(item['title'])}{suffix}"
                     item["file"] = arcname
