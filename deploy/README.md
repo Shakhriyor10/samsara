@@ -11,7 +11,7 @@ The bot listens on `127.0.0.1:8080`. Nginx is the public HTTPS endpoint and Cert
 
 ## Upload
 
-The project is already expected at `/var/www/samsara`. Include `main.py`, `miniapp_server.py`, `requirements.txt`, `webapp/`, `deploy/`, the existing `.venv/`, and the populated `.env`. Do not upload `__pycache__/` or local logs.
+The project is already expected at `/var/www/samsara`. Include `main.py`, `miniapp_server.py`, `pti_checklist.py`, `pti_reports.py`, `requirements.txt`, `webapp/`, `deploy/`, the existing `.venv/`, and the populated `.env`. Do not upload `__pycache__/` or local logs.
 
 To preserve current configuration and PTI records, keep `samsara_bot.sqlite3` and `pti_uploads/` in `/var/www/samsara/` as temporary staging files. The setup script imports them into `/var/lib/samsara` on first setup and leaves an existing server database intact on reruns. The database contains fleet configuration and Telegram IDs; the photo directory contains private driver images. Transfer them only over SSH/SFTP.
 

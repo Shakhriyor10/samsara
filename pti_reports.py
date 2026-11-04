@@ -1,0 +1,259 @@
+"""Build a ZIP of each submitted PTI and post it to the configured Telegram report group."""
+
+from __future__ import annotations
+
+import asyncio
+import html
+import json
+import logging
+import re
+import sqlite3
+import tempfile
+import zipfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+from aiogram import Bot
+from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter, TelegramServerError
+from aiogram.types import FSInputFile
+
+import pti_checklist
+
+
+logger = logging.getLogger("samsara_pti_reports")
+# Telegram bots may upload files up to 50 MB; leave room for ZIP headers.
+ZIP_PART_LIMIT = 48 * 1024 * 1024
+VIDEO_SUFFIXES = {".mp4", ".mov", ".webm"}
+TRANSCODE_TIMEOUT_SECONDS = 600
+_BUILD_LOCK: asyncio.Lock | None = None
+
+
+def submission_items(slots: set[str], answers: dict) -> list[dict]:
+    """Captured steps of one PTI in checklist order, plus any older six-view photos."""
+    items: list[dict] = []
+    known = set()
+    for step in [*pti_checklist.CHECKLIST_STEPS, pti_checklist.WALKAROUND_STEP]:
+        key = step["key"]
+        known.add(key)
+        answer = answers.get(key) or {}
+        if key not in slots and not answer:
+            continue
+        items.append({
+            "key": key, "title": step["title"], "kind": step["kind"],
+            "section": step["section"], "sectionTitle": step["sectionTitle"],
+            "hasMedia": key in slots, "answer": answer,
+        })
+    for key in sorted(slots - known):
+        items.append({
+            "key": key, "title": pti_checklist.step_label(key), "kind": "photo",
+            "section": "legacy", "sectionTitle": "Photos", "hasMedia": True, "answer": {},
+        })
+    return items
+
+
+def schedule_report(app, submission_id: str) -> None:
+    tasks: set[asyncio.Task] = app.setdefault("pti_report_tasks", set())
+    task = asyncio.create_task(send_pti_report(app["bot"], app["core"], submission_id))
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
+
+
+def _safe_name(value: str, limit: int = 60) -> str:
+    cleaned = re.sub(r"[^\w.\- ]+", "", value).strip().replace(" ", "_")
+    return (cleaned or "item")[:limit]
+
+
+async def _transcode(source: Path, target: Path) -> bool:
+    """Shrink a phone recording to H.264 720p so the archive stays under Telegram's limit."""
+    longest = "1280"
+    scale = f"scale='if(gt(iw,ih),min({longest},iw),-2)':'if(gt(iw,ih),-2,min({longest},ih))'"
+    process = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-y", "-v", "error", "-i", str(source), "-vf", scale,
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "28", "-maxrate", "1500k", "-bufsize", "3000k",
+        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "64k", "-movflags", "+faststart", str(target),
+        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        _, stderr = await asyncio.wait_for(process.communicate(), TRANSCODE_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.wait()
+        logger.warning("Timed out compressing PTI video %s", source.name)
+        return False
+    if process.returncode != 0 or not target.is_file():
+        logger.warning("Could not compress PTI video %s: %s", source.name, stderr.decode(errors="replace")[-500:])
+        return False
+    return True
+
+
+def _report_text(meta: dict, items: list[dict]) -> str:
+    lines = [
+        "PTI INSPECTION REPORT",
+        f"Truck: {meta['truck']}",
+        f"Company: {meta['company']}",
+        f"Driver: {meta['driver']} (Telegram {meta['driver_id']})",
+        f"Submitted: {meta['submitted']}",
+        f"Includes: {meta['mode_label']}",
+        "",
+    ]
+    section = None
+    for item in items:
+        if item["sectionTitle"] != section:
+            section = item["sectionTitle"]
+            lines += ["", section.upper()]
+        answer = item["answer"]
+        if answer.get("na"):
+            result = "Not applicable"
+        elif "result" in answer:
+            result = "PASS" if answer["result"] == "pass" else "FAIL"
+        elif item["kind"] == "photo":
+            result = "Photo" + (f" - {answer['psi']:g} PSI" if "psi" in answer else "")
+        else:
+            result = "Video"
+        if item["hasMedia"] and item.get("file"):
+            result += f" ({item['file']})"
+        lines.append(f"- {item['title']}: {result}")
+    return "\n".join(lines) + "\n"
+
+
+def _pack_parts(files: list[tuple[Path, str]], report: str, base: Path) -> list[Path]:
+    """Pack files into as few ZIPs as fit Telegram's upload limit; each part opens on its own."""
+    groups: list[list[tuple[Path, str]]] = [[]]
+    sizes = [len(report.encode())]
+    for path, arcname in files:
+        size = path.stat().st_size
+        if sizes[-1] + size > ZIP_PART_LIMIT and groups[-1]:
+            groups.append([])
+            sizes.append(0)
+        groups[-1].append((path, arcname))
+        sizes[-1] += size
+    parts = []
+    for index, group in enumerate(groups, start=1):
+        suffix = f"_part{index}of{len(groups)}" if len(groups) > 1 else ""
+        target = base.with_name(f"{base.name}{suffix}.zip")
+        # Photos and videos are already compressed; storing them keeps packing fast.
+        with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_STORED) as archive:
+            archive.writestr("report.txt", report, compress_type=zipfile.ZIP_DEFLATED)
+            for path, arcname in group:
+                archive.write(path, arcname)
+        parts.append(target)
+    return parts
+
+
+def _load_submission(core, submission_id: str) -> tuple[dict, list[dict], list[tuple[str, str]], int | None] | None:
+    with sqlite3.connect(core.STATE_DB) as conn:
+        row = conn.execute(
+            "SELECT s.telegram_user_id,s.account_id,s.truck_id,s.submitted_at,s.mode,s.answers,"
+            "COALESCE(d.truck_name,s.truck_id),COALESCE(d.telegram_name,'') "
+            "FROM pti_submissions s LEFT JOIN driver_accounts d ON d.account_id=s.account_id AND d.truck_id=s.truck_id "
+            "WHERE s.id=?", (submission_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        media = conn.execute("SELECT slot,file_path FROM pti_photos WHERE submission_id=?", (submission_id,)).fetchall()
+        chat_row = conn.execute("SELECT value FROM pti_settings WHERE key='report_chat_id'").fetchone()
+    chat_value = (chat_row[0] if chat_row else "") or ""
+    chat_id = int(chat_value) if chat_value.lstrip("-").isdigit() else None
+    submitted = datetime.fromisoformat(row[3].replace("Z", "+00:00"))
+    if submitted.tzinfo is None:
+        submitted = submitted.replace(tzinfo=timezone.utc)
+    local = submitted.astimezone(core.ZoneInfo(core.EVENT_TIMEZONE))
+    mode = row[4] or "photo"
+    meta = {
+        "truck": row[6], "company": core.account_label(row[1]), "driver": row[7] or "Driver",
+        "driver_id": row[0], "submitted": local.strftime("%b %d, %Y %I:%M %p %Z"),
+        "stamp": local.strftime("%Y-%m-%d_%H%M"), "mode": mode,
+        "mode_label": {"photo": "Photo checklist", "video": "Walk-around video", "both": "Photo checklist + walk-around video"}[mode],
+    }
+    items = submission_items({slot for slot, _ in media}, json.loads(row[5] or "{}"))
+    return meta, items, media, chat_id
+
+
+def _record(core, submission_id: str, chat_id: int | None, error: str | None) -> None:
+    sent_at = None if error else datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    with sqlite3.connect(core.STATE_DB) as conn:
+        conn.execute(
+            "INSERT INTO pti_reports(submission_id,chat_id,sent_at,error) VALUES(?,?,?,?) "
+            "ON CONFLICT(submission_id) DO UPDATE SET chat_id=excluded.chat_id,sent_at=excluded.sent_at,error=excluded.error",
+            (submission_id, chat_id, sent_at, error),
+        )
+
+
+async def send_pti_report(bot: Bot, core, submission_id: str) -> None:
+    global _BUILD_LOCK
+    _BUILD_LOCK = _BUILD_LOCK or asyncio.Lock()
+    try:
+        loaded = await asyncio.to_thread(_load_submission, core, submission_id)
+        if loaded is None:
+            return
+        meta, items, media, chat_id = loaded
+        if chat_id is None:
+            await asyncio.to_thread(_record, core, submission_id, None, "No PTI report group is configured")
+            return
+        upload_root = Path(core.STATE_DB).resolve().parent / "pti_uploads"
+        files_by_slot = dict(media)
+        # One archive at a time: video compression is CPU-heavy.
+        async with _BUILD_LOCK:
+            with tempfile.TemporaryDirectory(prefix="pti_report_") as workdir:
+                work = Path(workdir)
+                packed: list[tuple[Path, str]] = []
+                section_numbers: dict[str, int] = {}
+                for number, item in enumerate(items, start=1):
+                    section_numbers.setdefault(item["sectionTitle"], len(section_numbers) + 1)
+                    if not item["hasMedia"]:
+                        continue
+                    source = upload_root / files_by_slot[item["key"]]
+                    if not source.is_file():
+                        continue
+                    suffix = source.suffix.lower()
+                    if suffix in VIDEO_SUFFIXES:
+                        compressed = work / f"{item['key']}.mp4"
+                        if await _transcode(source, compressed):
+                            source, suffix = compressed, ".mp4"
+                    folder = f"{section_numbers[item['sectionTitle']]:02d}_{_safe_name(item['sectionTitle'])}"
+                    arcname = f"{folder}/{number:02d}_{_safe_name(item['title'])}{suffix}"
+                    item["file"] = arcname
+                    packed.append((source, arcname))
+                report = _report_text(meta, items)
+                base = work / f"PTI_{_safe_name(meta['truck'], 40)}_{meta['stamp']}"
+                parts = await asyncio.to_thread(_pack_parts, packed, report, base)
+                failed = [item["title"] for item in items if item["answer"].get("result") == "fail"]
+                caption = (
+                    f"📋 <b>PTI · {html.escape(meta['truck'])}</b>\n"
+                    f"{html.escape(meta['company'])}\n"
+                    f"Driver: {html.escape(meta['driver'])}\n"
+                    f"Submitted: {html.escape(meta['submitted'])}\n"
+                    f"Includes: {html.escape(meta['mode_label'])}"
+                )
+                if failed:
+                    caption += "\n⚠️ Failed: " + html.escape(", ".join(failed))
+                for index, part in enumerate(parts, start=1):
+                    part_caption = caption + (f"\nPart {index} of {len(parts)}" if len(parts) > 1 else "")
+                    await _send_with_retry(bot, chat_id, part, part_caption[:1024])
+        await asyncio.to_thread(_record, core, submission_id, chat_id, None)
+        logger.info("Sent PTI report %s to chat %s", submission_id, chat_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        logger.exception("Could not send PTI report %s", submission_id)
+        try:
+            await asyncio.to_thread(_record, core, submission_id, None, str(error)[:500])
+        except Exception:
+            logger.exception("Could not record PTI report failure %s", submission_id)
+
+
+async def _send_with_retry(bot: Bot, chat_id: int, path: Path, caption: str) -> None:
+    for attempt in range(3):
+        try:
+            await bot.send_document(
+                chat_id, FSInputFile(path, filename=path.name), caption=caption,
+                parse_mode="HTML", request_timeout=900,
+            )
+            return
+        except TelegramRetryAfter as error:
+            await asyncio.sleep(error.retry_after + 1)
+        except (TelegramNetworkError, TelegramServerError):
+            if attempt == 2:
+                raise
+            await asyncio.sleep(10 * (attempt + 1))
+    raise RuntimeError("Telegram kept rate-limiting the PTI report upload")

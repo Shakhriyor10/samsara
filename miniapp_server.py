@@ -21,12 +21,14 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 
+import pti_checklist
+import pti_reports
+
 
 logger = logging.getLogger("samsara_webapp")
 WEB_ROOT = Path(__file__).parent / "webapp"
 INIT_DATA_MAX_AGE_SECONDS = 24 * 60 * 60
 ACTIVE_EVENT_SENDS: set[tuple[int, str, str, str]] = set()
-PTI_PHOTO_SLOTS = ("front", "rear", "driver_side", "passenger_side", "cabin", "dashboard")
 PTI_PHOTO_RETENTION_DAYS = 15
 EVENT_VIDEO_CACHE_DAYS = 6
 EVENT_VIDEO_CACHE_TASKS: dict[str, asyncio.Task] = {}
@@ -221,7 +223,7 @@ async def start_media_retention(app: web.Application) -> None:
 
 
 async def stop_media_retention(app: web.Application) -> None:
-    video_tasks = list(app.get("event_video_cache_tasks", {}).values())
+    video_tasks = [*app.get("event_video_cache_tasks", {}).values(), *app.get("pti_report_tasks", set())]
     for video_task in video_tasks:
         video_task.cancel()
     if video_tasks:
@@ -259,6 +261,23 @@ def ensure_pti_schema(core) -> None:
             conn.execute("ALTER TABLE pti_submissions ADD COLUMN invalidated_at TEXT")
         if "invalidation_reason" not in submission_columns:
             conn.execute("ALTER TABLE pti_submissions ADD COLUMN invalidation_reason TEXT")
+        if "mode" not in submission_columns:
+            conn.execute("ALTER TABLE pti_submissions ADD COLUMN mode TEXT")
+        if "answers" not in submission_columns:
+            conn.execute("ALTER TABLE pti_submissions ADD COLUMN answers TEXT")
+        conn.execute(
+            "INSERT OR IGNORE INTO pti_settings(key, value) VALUES('reminder_hours', '2')"
+        )
+        # Which parts of the PTI each truck requires; trucks without a row use photos only.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS pti_truck_modes (account_id TEXT NOT NULL, truck_id TEXT NOT NULL, "
+            "photos INTEGER NOT NULL DEFAULT 1, video INTEGER NOT NULL DEFAULT 0, "
+            "PRIMARY KEY(account_id, truck_id))"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS pti_reports (submission_id TEXT PRIMARY KEY, chat_id INTEGER, "
+            "sent_at TEXT, error TEXT)"
+        )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_pti_submissions_driver "
             "ON pti_submissions(telegram_user_id, submitted_at DESC)"
@@ -595,6 +614,45 @@ def pti_timing(
     }
 
 
+def read_pti_settings(conn: sqlite3.Connection) -> dict:
+    values = dict(conn.execute("SELECT key, value FROM pti_settings").fetchall())
+    report_chat_id = values.get("report_chat_id") or ""
+    return {
+        "intervalHours": int(values.get("interval_hours") or 24),
+        "reminderHours": int(values.get("reminder_hours") or 2),
+        "reportChatId": int(report_chat_id) if report_chat_id.lstrip("-").isdigit() else None,
+        "reportChatTitle": values.get("report_chat_title") or None,
+    }
+
+
+def save_pti_setting(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        "INSERT INTO pti_settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, value),
+    )
+
+
+def truck_pti_mode(conn: sqlite3.Connection, account_id: str, truck_id: str) -> tuple[bool, bool]:
+    row = conn.execute(
+        "SELECT photos, video FROM pti_truck_modes WHERE account_id=? AND truck_id=?", (account_id, truck_id)
+    ).fetchone()
+    return (bool(row[0]), bool(row[1])) if row else (True, False)
+
+
+async def resolve_report_group(bot: Bot, value) -> tuple[int, str, str]:
+    """Check that the bot can post in the group an admin picked or typed."""
+    for candidate in telegram_group_id_candidates(value):
+        try:
+            chat = await bot.get_chat(candidate)
+        except Exception:
+            logger.info("PTI report group lookup failed for %s", candidate, exc_info=True)
+            continue
+        if getattr(chat, "type", None) not in {"group", "supergroup"}:
+            raise web.HTTPBadRequest(text="This Telegram chat is not a group")
+        return int(chat.id), chat.title or str(chat.id), chat.type
+    raise web.HTTPBadRequest(text="The bot cannot access this group. Add the bot to the group and try again.")
+
+
 async def api_pti_settings(request: web.Request) -> web.Response:
     await require_admin(request)
     core = request.app["core"]
@@ -602,17 +660,29 @@ async def api_pti_settings(request: web.Request) -> web.Response:
         try:
             payload = await request.json()
             hours = int(payload.get("intervalHours", 24))
-        except (ValueError, AttributeError, json.JSONDecodeError, web.HTTPBadRequest) as error:
-            raise web.HTTPBadRequest(text="Enter an interval from 1 to 168 hours") from error
+            reminder_hours = int(payload.get("reminderHours", 2))
+        except (ValueError, TypeError, AttributeError, json.JSONDecodeError, web.HTTPBadRequest) as error:
+            raise web.HTTPBadRequest(text="Enter valid PTI interval and reminder hours") from error
         if not 1 <= hours <= 168:
             raise web.HTTPBadRequest(text="PTI interval must be between 1 and 168 hours")
+        if not 1 <= reminder_hours <= 48:
+            raise web.HTTPBadRequest(text="Reminder interval must be between 1 and 48 hours")
+        report_group = None
+        group_value = str(payload.get("reportGroupId") or "").strip()
+        if group_value:
+            report_group = await resolve_report_group(request.app["bot"], group_value)
+            core.remember_bot_group(*report_group, True)
         with sqlite3.connect(core.STATE_DB) as conn:
-            conn.execute(
-                "INSERT INTO pti_settings(key,value) VALUES('interval_hours',?) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(hours),)
-            )
+            save_pti_setting(conn, "interval_hours", str(hours))
+            save_pti_setting(conn, "reminder_hours", str(reminder_hours))
+            save_pti_setting(conn, "report_chat_id", str(report_group[0]) if report_group else "")
+            save_pti_setting(conn, "report_chat_title", report_group[1] if report_group else "")
     with sqlite3.connect(core.STATE_DB) as conn:
-        row = conn.execute("SELECT value FROM pti_settings WHERE key='interval_hours'").fetchone()
+        settings = read_pti_settings(conn)
+        modes = {
+            (str(row[0]), str(row[1])): (bool(row[2]), bool(row[3]))
+            for row in conn.execute("SELECT account_id, truck_id, photos, video FROM pti_truck_modes")
+        }
         linked = conn.execute("SELECT COUNT(*) FROM driver_accounts").fetchone()[0]
         drivers = conn.execute(
             "SELECT d.telegram_user_id,d.telegram_name,d.account_id,d.truck_id,d.truck_name,d.linked_at,"
@@ -626,19 +696,54 @@ async def api_pti_settings(request: web.Request) -> web.Response:
             "AND s.account_id=d.account_id AND s.truck_id=d.truck_id ORDER BY s.submitted_at DESC LIMIT 1) "
             "FROM driver_accounts d ORDER BY d.truck_name COLLATE NOCASE"
         ).fetchall()
-    interval_hours = int(row[0]) if row else 24
+    interval_hours = settings["intervalHours"]
     now = datetime.now(timezone.utc)
     driver_items = []
     for user_id, name, account_id, truck_id, truck_name, linked_at, last_id, submitted_at, invalidated_at, invalidation_reason in drivers:
         timing = pti_timing(submitted_at or linked_at, interval_hours, now, invalidated_at, first_submission=not submitted_at)
+        photos, video = modes.get((str(account_id), str(truck_id)), (True, False))
         driver_items.append({
             "telegramUserId": str(user_id), "name": name, "accountId": account_id,
             "truckId": truck_id, "truckName": truck_name,
             "company": "U.Z. Freight" if account_id == "1" else "Safe & Secure",
             "submissionId": last_id, "lastSubmittedAt": submitted_at,
-            "invalidationReason": invalidation_reason, **timing,
+            "invalidationReason": invalidation_reason, "ptiPhotos": photos, "ptiVideo": video, **timing,
         })
-    return web.json_response({"intervalHours": interval_hours, "linkedDrivers": linked, "drivers": driver_items})
+    report_group = (
+        {"id": str(settings["reportChatId"]), "name": settings["reportChatTitle"] or str(settings["reportChatId"])}
+        if settings["reportChatId"] else None
+    )
+    return web.json_response({
+        "intervalHours": interval_hours, "reminderHours": settings["reminderHours"],
+        "reportGroup": report_group, "linkedDrivers": linked, "drivers": driver_items,
+        "modes": [
+            {"accountId": key[0], "truckId": key[1], "photos": value[0], "video": value[1]}
+            for key, value in modes.items()
+        ],
+    })
+
+
+async def api_truck_pti_mode(request: web.Request) -> web.Response:
+    await require_admin(request)
+    core = request.app["core"]
+    account_id, truck_id = request.match_info["account_id"], request.match_info["vehicle_id"]
+    if not any(item.account_id == account_id for item in core.ACCOUNTS):
+        raise web.HTTPNotFound(text="Company not found")
+    try:
+        payload = await request.json()
+    except (json.JSONDecodeError, web.HTTPBadRequest) as error:
+        raise web.HTTPBadRequest(text="Invalid request body") from error
+    photos = bool(payload.get("photos")) if isinstance(payload, dict) else False
+    video = bool(payload.get("video")) if isinstance(payload, dict) else False
+    if not photos and not video:
+        raise web.HTTPBadRequest(text="Keep photos or video enabled for this truck's PTI")
+    with sqlite3.connect(core.STATE_DB) as conn:
+        conn.execute(
+            "INSERT INTO pti_truck_modes(account_id, truck_id, photos, video) VALUES(?,?,?,?) "
+            "ON CONFLICT(account_id, truck_id) DO UPDATE SET photos=excluded.photos, video=excluded.video",
+            (account_id, truck_id, int(photos), int(video)),
+        )
+    return web.json_response({"accountId": account_id, "truckId": truck_id, "photos": photos, "video": video})
 
 
 def pti_status_payload(core, user_id: int, link: dict) -> dict:
@@ -657,6 +762,7 @@ def pti_status_payload(core, user_id: int, link: dict) -> dict:
             "ORDER BY submitted_at DESC LIMIT 20",
             (user_id, link["account_id"], link["truck_id"]),
         ).fetchall()
+        photos, video = truck_pti_mode(conn, link["account_id"], link["truck_id"])
     interval_hours = int(interval_row[0]) if interval_row else 24
     now = datetime.now(timezone.utc)
     anchor = latest["submitted_at"] if latest else link["linked_at"]
@@ -675,10 +781,11 @@ def pti_status_payload(core, user_id: int, link: dict) -> dict:
         "isInvalidated": bool(latest and latest["invalidated_at"]),
         "invalidationReason": latest["invalidation_reason"] if latest else None,
         **timing,
+        "mode": pti_checklist.mode_name(photos, video),
+        "steps": pti_checklist.steps_for_mode(photos, video),
         "history": [{
             "id": row["id"], "submittedAt": row["submitted_at"],
             "invalidatedAt": row["invalidated_at"], "invalidationReason": row["invalidation_reason"],
-            "photos": list(PTI_PHOTO_SLOTS),
         } for row in history],
     }
 
@@ -722,68 +829,132 @@ async def api_driver_activity(request: web.Request) -> web.Response:
         raise web.HTTPBadGateway(text="Could not load recent safety activity") from error
 
 
+PTI_IMAGE_TYPES = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
+PTI_VIDEO_TYPES = {"video/mp4": ".mp4", "video/quicktime": ".mov", "video/webm": ".webm", "video/x-matroska": ".webm"}
+PTI_MAX_PHOTO_BYTES = 8 * 1024 * 1024
+PTI_MAX_VIDEO_BYTES = 150 * 1024 * 1024
+PTI_MAX_UPLOAD_BYTES = 350 * 1024 * 1024
+
+
+def media_signature_ok(content_type: str, head: bytes) -> bool:
+    if content_type == "image/jpeg":
+        return head.startswith(b"\xff\xd8\xff")
+    if content_type == "image/png":
+        return head.startswith(b"\x89PNG\r\n\x1a\n")
+    if content_type == "image/webp":
+        return len(head) >= 12 and head.startswith(b"RIFF") and head[8:12] == b"WEBP"
+    if content_type in {"video/mp4", "video/quicktime"}:
+        return len(head) >= 8 and head[4:8] == b"ftyp"
+    if content_type in {"video/webm", "video/x-matroska"}:
+        return head.startswith(b"\x1a\x45\xdf\xa3")
+    return False
+
+
+def validate_pti_answers(steps: list[dict], answers: dict, files: dict[str, str]) -> dict:
+    """Check every required step has its media or answer; return the answers worth keeping."""
+    kept: dict[str, dict] = {}
+    for step in steps:
+        key, kind = step["key"], step["kind"]
+        answer = answers.get(key) if isinstance(answers.get(key), dict) else {}
+        if step.get("optional") and answer.get("na") is True:
+            if key in files:
+                raise web.HTTPBadRequest(text=f"{step['title']} is marked not applicable but has a photo")
+            kept[key] = {"na": True}
+            continue
+        if kind == "check":
+            if answer.get("result") not in {"pass", "fail"}:
+                raise web.HTTPBadRequest(text=f"Mark {step['title']} as Pass or Fail")
+            kept[key] = {"result": answer["result"]}
+            continue
+        if key not in files:
+            what = "photo" if kind == "photo" else "video"
+            raise web.HTTPBadRequest(text=f"The {what} for {step['title']} is missing")
+        if step.get("input") == "psi":
+            try:
+                psi = float(answer.get("psi"))
+            except (TypeError, ValueError) as error:
+                raise web.HTTPBadRequest(text=f"Enter the PSI reading for {step['title']}") from error
+            if not 1 <= psi <= 200:
+                raise web.HTTPBadRequest(text="Tire pressure must be between 1 and 200 PSI")
+            kept[key] = {"psi": round(psi, 1)}
+    unexpected = set(files) - {step["key"] for step in steps}
+    if unexpected:
+        raise web.HTTPConflict(text="This truck's PTI requirements changed. Close the inspection and start again.")
+    return kept
+
+
 async def api_pti_submit(request: web.Request) -> web.Response:
     user, role, link = await require_user(request)
     if role != "driver" or link is None:
         raise web.HTTPForbidden(text="This PTI action is for linked drivers")
-    schedule = pti_status_payload(request.app["core"], int(user["id"]), link)
+    core = request.app["core"]
+    schedule = pti_status_payload(core, int(user["id"]), link)
     if not schedule["canSubmit"]:
-        core = request.app["core"]
         available_at = parse_utc_timestamp(schedule["canSubmitAt"]).astimezone(
             core.ZoneInfo(core.EVENT_TIMEZONE)
         ).strftime("%b %d, %Y at %I:%M %p %Z")
         raise web.HTTPConflict(text=f"You can start the next PTI at {available_at}.")
-    reader = await request.multipart()
-    fields: dict[str, tuple[bytes, str]] = {}
-    total_size = 0
-    while part := await reader.next():
-        if part.name not in PTI_PHOTO_SLOTS or part.name in fields or not part.filename:
-            raise web.HTTPBadRequest(text="Submit one camera photo for each required PTI view")
-        content_type = part.headers.get("Content-Type", "")
-        if content_type not in {"image/jpeg", "image/png", "image/webp"}:
-            raise web.HTTPBadRequest(text="PTI photos must be JPEG, PNG, or WebP images")
-        content = await part.read(decode=False)
-        total_size += len(content)
-        if len(content) > 8 * 1024 * 1024 or total_size > 30 * 1024 * 1024:
-            raise web.HTTPRequestEntityTooLarge(max_size=30 * 1024 * 1024, actual_size=total_size)
-        if not content:
-            raise web.HTTPBadRequest(text="A PTI photo is empty")
-        signatures = {
-            "image/jpeg": content.startswith(b"\xff\xd8\xff"),
-            "image/png": content.startswith(b"\x89PNG\r\n\x1a\n"),
-            "image/webp": len(content) >= 12 and content.startswith(b"RIFF") and content[8:12] == b"WEBP",
-        }
-        if not signatures.get(content_type, False):
-            raise web.HTTPBadRequest(text="The captured photo data is invalid. Please retake it.")
-        fields[part.name] = (content, content_type)
-    if set(fields) != set(PTI_PHOTO_SLOTS):
-        raise web.HTTPBadRequest(text="Take all six required PTI photos before submitting")
-
-    core = request.app["core"]
+    steps = schedule["steps"]
+    step_kinds = {step["key"]: step["kind"] for step in steps}
     photo_root = Path(core_state_path(core)) / "pti_uploads"
-    photo_root.mkdir(parents=True, exist_ok=True)
+    await asyncio.to_thread(photo_root.mkdir, parents=True, exist_ok=True)
     submission_id = uuid.uuid4().hex
-    saved: list[tuple[str, str]] = []
+    files: dict[str, str] = {}
+    answers: dict = {}
+    total_size = 0
     try:
-        for slot, (content, content_type) in fields.items():
-            suffix = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}[content_type]
-            filename = f"{submission_id}_{slot}{suffix}"
-            (photo_root / filename).write_bytes(content)
-            saved.append((slot, filename))
+        reader = await request.multipart()
+        while part := await reader.next():
+            if part.name == "answers" and not part.filename:
+                try:
+                    answers = json.loads(await part.text())
+                except json.JSONDecodeError as error:
+                    raise web.HTTPBadRequest(text="Invalid PTI answers") from error
+                if not isinstance(answers, dict):
+                    raise web.HTTPBadRequest(text="Invalid PTI answers")
+                continue
+            kind = step_kinds.get(part.name or "")
+            if kind is None:
+                raise web.HTTPConflict(text="This truck's PTI requirements changed. Close the inspection and start again.")
+            if part.name in files or not part.filename or kind == "check":
+                raise web.HTTPBadRequest(text="Submit one capture for each PTI step")
+            content_type = part.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            allowed = PTI_IMAGE_TYPES if kind == "photo" else PTI_VIDEO_TYPES
+            if content_type not in allowed:
+                raise web.HTTPBadRequest(text="PTI photos must be images and PTI recordings must be videos")
+            limit = PTI_MAX_PHOTO_BYTES if kind == "photo" else PTI_MAX_VIDEO_BYTES
+            filename = f"{submission_id}_{part.name}{allowed[content_type]}"
+            files[part.name] = filename
+            size = 0
+            with open(photo_root / filename, "wb") as handle:
+                while chunk := await part.read_chunk(256 * 1024):
+                    if size == 0 and not media_signature_ok(content_type, chunk[:16]):
+                        raise web.HTTPBadRequest(text="A captured file is damaged. Please retake it.")
+                    size += len(chunk)
+                    total_size += len(chunk)
+                    if size > limit or total_size > PTI_MAX_UPLOAD_BYTES:
+                        raise web.HTTPRequestEntityTooLarge(max_size=limit, actual_size=size)
+                    handle.write(chunk)
+            if size == 0:
+                raise web.HTTPBadRequest(text="A captured file is empty. Please retake it.")
+        kept_answers = validate_pti_answers(steps, answers, files)
         submitted_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
         with sqlite3.connect(core.STATE_DB) as conn:
             conn.execute(
-                "INSERT INTO pti_submissions(id,telegram_user_id,account_id,truck_id,submitted_at) VALUES(?,?,?,?,?)",
-                (submission_id, int(user["id"]), link["account_id"], link["truck_id"], submitted_at),
+                "INSERT INTO pti_submissions(id,telegram_user_id,account_id,truck_id,submitted_at,mode,answers) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (submission_id, int(user["id"]), link["account_id"], link["truck_id"], submitted_at,
+                 schedule["mode"], json.dumps(kept_answers)),
             )
             conn.executemany(
                 "INSERT INTO pti_photos(submission_id,slot,file_path) VALUES(?,?,?)",
-                [(submission_id, slot, filename) for slot, filename in saved],
+                [(submission_id, slot, filename) for slot, filename in files.items()],
             )
-    except Exception:
-        for _, filename in saved:
+    except BaseException:
+        for filename in files.values():
             (photo_root / filename).unlink(missing_ok=True)
         raise
+    pti_reports.schedule_report(request.app, submission_id)
     return web.json_response({"id": submission_id, "submittedAt": submitted_at}, status=201)
 
 
@@ -810,8 +981,8 @@ async def api_notify_truck_driver(request: web.Request) -> web.Response:
     bot: Bot = request.app["bot"]
     keyboard = pti_app_keyboard(core)
     next_step = (
-        "Please open the PTI app and complete the required six photos."
-        if keyboard else "Open the bot and send /app to complete the required six photos."
+        "Please open the PTI app and complete your inspection."
+        if keyboard else "Open the bot and send /app to complete your inspection."
     )
     text = f"📋 PTI reminder for <b>{html.escape(row[2])}</b>. {next_step}"
     try:
@@ -898,6 +1069,27 @@ async def api_invalidate_pti(request: web.Request) -> web.Response:
 
 def core_state_path(core) -> str:
     return str(Path(core.STATE_DB).resolve().parent)
+
+
+async def api_pti_submission(request: web.Request) -> web.Response:
+    """Everything captured in one PTI, in checklist order, for the archive views."""
+    user, role, link = await require_user(request)
+    core = request.app["core"]
+    submission_id = request.match_info["submission_id"]
+    with sqlite3.connect(core.STATE_DB) as conn:
+        row = conn.execute(
+            "SELECT telegram_user_id,account_id,truck_id,submitted_at,mode,answers FROM pti_submissions WHERE id=?",
+            (submission_id,),
+        ).fetchone()
+        slots = {slot for (slot,) in conn.execute("SELECT slot FROM pti_photos WHERE submission_id=?", (submission_id,))}
+    if row is None:
+        raise web.HTTPNotFound(text="PTI submission not found")
+    if role != "admin" and (int(row[0]) != int(user["id"]) or row[1] != link["account_id"] or row[2] != link["truck_id"]):
+        raise web.HTTPForbidden(text="You cannot view another driver's PTI")
+    return web.json_response({
+        "id": submission_id, "submittedAt": row[3], "mode": row[4] or "photo",
+        "items": pti_reports.submission_items(slots, json.loads(row[5] or "{}")),
+    })
 
 
 async def api_pti_photo(request: web.Request) -> web.StreamResponse:
@@ -1488,7 +1680,9 @@ def create_app(bot: Bot, core) -> web.Application:
     app.router.add_get("/api/pti/activity", api_driver_activity)
     app.router.add_post("/api/pti/submit", api_pti_submit)
     app.router.add_post("/api/pti/submissions/{submission_id}/invalidate", api_invalidate_pti)
+    app.router.add_get("/api/pti/submissions/{submission_id}", api_pti_submission)
     app.router.add_get("/api/pti/submissions/{submission_id}/photos/{slot}", api_pti_photo)
+    app.router.add_post("/api/trucks/{account_id}/{vehicle_id}/pti/mode", api_truck_pti_mode)
     app.router.add_get("/api/alerts", api_alerts)
     app.router.add_get("/api/alerts/live", api_live_alerts)
     app.router.add_post("/api/trucks/{account_id}/{vehicle_id}/groups", api_add_truck_group)

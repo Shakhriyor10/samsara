@@ -1961,7 +1961,7 @@ async def samsara_worker(bot: Bot, account: SamsaraAccount) -> None:
 
 
 async def pti_reminder_worker(bot: Bot) -> None:
-    """Send one Telegram reminder six hours after a driver's PTI deadline."""
+    """Remind drivers every few hours (PTI settings) once their PTI is overdue, until they submit."""
     while True:
         try:
             now = datetime.now(timezone.utc)
@@ -1970,6 +1970,10 @@ async def pti_reminder_worker(bot: Bot) -> None:
                     "SELECT value FROM pti_settings WHERE key='interval_hours'"
                 ).fetchone()
                 interval_hours = int(interval_row[0]) if interval_row else 24
+                reminder_row = conn.execute(
+                    "SELECT value FROM pti_settings WHERE key='reminder_hours'"
+                ).fetchone()
+                reminder_hours = max(1, int(reminder_row[0])) if reminder_row else 2
                 drivers = conn.execute(
                     "SELECT d.telegram_user_id,d.truck_name,d.linked_at,"
                     "(SELECT s.id FROM pti_submissions s WHERE s.telegram_user_id=d.telegram_user_id "
@@ -1986,19 +1990,23 @@ async def pti_reminder_worker(bot: Bot) -> None:
                     anchor = datetime.fromisoformat(anchor_text.replace("Z", "+00:00"))
                     if anchor.tzinfo is None:
                         anchor = anchor.replace(tzinfo=timezone.utc)
-                    deadline = anchor + timedelta(hours=interval_hours)
-                    reminder_at = deadline + timedelta(hours=6)
+                    # A returned PTI is due immediately, like pti_timing in the Mini App API.
+                    deadline = anchor if invalidated_at else anchor + timedelta(hours=interval_hours)
                 except (AttributeError, TypeError, ValueError):
                     logger.warning("Invalid PTI schedule timestamp for Telegram user %s", user_id)
                     continue
-                if now < reminder_at:
+                # The first reminder goes out reminder_hours after the deadline, then again
+                # every reminder_hours. Only the latest one is sent after a bot restart.
+                reminder_number = int((now - deadline) / timedelta(hours=reminder_hours))
+                if reminder_number < 1:
                     continue
+                kind = f"overdue:{reminder_number}"
                 schedule_anchor = anchor.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
                 sent_at = utc_iso(now)
                 with sqlite3.connect(STATE_DB) as conn:
                     cursor = conn.execute(
                         "INSERT OR IGNORE INTO pti_notifications(telegram_user_id,schedule_anchor,kind,sent_at) "
-                        "VALUES(?,?,'overdue',?)", (int(user_id), schedule_anchor, sent_at)
+                        "VALUES(?,?,?,?)", (int(user_id), schedule_anchor, kind, sent_at)
                     )
                 if cursor.rowcount == 0:
                     continue
@@ -2006,17 +2014,18 @@ async def pti_reminder_worker(bot: Bot) -> None:
                     InlineKeyboardButton(text="Open PTI", web_app=WebAppInfo(url=WEBAPP_URL))
                 ]]) if WEBAPP_URL.startswith("https://") else None
                 message = (
-                    f"⏰ PTI is overdue for <b>{html.escape(str(truck_name))}</b>. "
-                    + ("Please complete the six required photos in the PTI app." if keyboard else "Please open the bot and send /app to complete the six required photos.")
+                    f"⏰ PTI is overdue for <b>{html.escape(str(truck_name))}</b> "
+                    f"(by {int((now - deadline) / timedelta(hours=1))} h). "
+                    + ("Please complete your inspection in the PTI app." if keyboard else "Please open the bot and send /app to complete your inspection.")
                 )
                 try:
                     await bot.send_message(int(user_id), message, reply_markup=keyboard)
-                    logger.info("Sent one overdue PTI reminder to Telegram user %s", user_id)
+                    logger.info("Sent overdue PTI reminder %s to Telegram user %s", reminder_number, user_id)
                 except Exception:
                     with sqlite3.connect(STATE_DB) as conn:
                         conn.execute(
-                            "DELETE FROM pti_notifications WHERE telegram_user_id=? AND schedule_anchor=? AND kind='overdue'",
-                            (int(user_id), schedule_anchor),
+                            "DELETE FROM pti_notifications WHERE telegram_user_id=? AND schedule_anchor=? AND kind=?",
+                            (int(user_id), schedule_anchor, kind),
                         )
                     logger.warning("Could not send overdue PTI reminder to Telegram user %s", user_id, exc_info=True)
         except Exception:
