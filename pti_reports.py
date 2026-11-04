@@ -26,8 +26,12 @@ ZIP_PART_LIMIT = 48 * 1024 * 1024
 VIDEO_SUFFIXES = {".mp4", ".mov", ".webm"}
 TRANSCODE_TIMEOUT_SECONDS = 600
 VIDEO_LONG_SIDE = 1920
-VIDEO_FPS = 30
-NORMALIZED_SUFFIX = "_30fps.mp4"
+# Keep 60 fps when the phone really recorded it; otherwise 30 fps.
+HIGH_FPS = 60
+BASE_FPS = 30
+NORMALIZED_SUFFIX = "_cfr.mp4"
+# Files written by the earlier 30 fps-only version are already normalized too.
+NORMALIZED_SUFFIXES = (NORMALIZED_SUFFIX, "_30fps.mp4")
 # One video must fit a ZIP part on its own, with room for the report.
 VIDEO_SIZE_LIMIT = ZIP_PART_LIMIT - 2 * 1024 * 1024
 _BUILD_LOCK: asyncio.Lock | None = None
@@ -98,23 +102,44 @@ async def _video_seconds(path: Path) -> float | None:
         return None
 
 
-async def _encode(source: Path, target: Path, rate_args: list[str]) -> bool:
-    """H.264 at up to 1080p and a constant 30 fps.
+async def _source_fps(path: Path) -> float | None:
+    """Measure the real frame rate from packet timestamps; phone recordings rarely state it correctly."""
+    process = await asyncio.create_subprocess_exec(
+        "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time",
+        "-of", "csv=p=0", str(path),
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+    )
+    stdout, _ = await process.communicate()
+    times = sorted(float(value) for value in stdout.decode().split() if value.replace(".", "", 1).isdigit())
+    if len(times) < 10 or times[-1] <= times[0]:
+        return None
+    return (len(times) - 1) / (times[-1] - times[0])
+
+
+async def _target_fps(source: Path) -> int:
+    fps = await _source_fps(source)
+    return HIGH_FPS if fps and fps >= 45 else BASE_FPS
+
+
+async def _encode(source: Path, target: Path, fps: int, rate_args: list[str]) -> bool:
+    """H.264 at up to 1080p and a constant frame rate.
 
     Phone browsers record variable frame rate video (WebM without an index on Android); many
-    players show that as stutter, so every frame gets an even 1/30 s slot.
+    players show that as stutter, so every frame gets an even 1/fps slot.
     """
     scale = f"scale='if(gt(iw,ih),min({VIDEO_LONG_SIDE},iw),-2)':'if(gt(iw,ih),-2,min({VIDEO_LONG_SIDE},ih))'"
     return await _run_ffmpeg(
-        ["-i", str(source), "-vf", f"{scale},fps={VIDEO_FPS}", "-fps_mode", "cfr", "-r", str(VIDEO_FPS),
-         "-c:v", "libx264", "-preset", "veryfast", *rate_args, "-g", str(VIDEO_FPS * 2), "-pix_fmt", "yuv420p",
+        ["-i", str(source), "-vf", f"{scale},fps={fps}", "-fps_mode", "cfr", "-r", str(fps),
+         "-c:v", "libx264", "-preset", "veryfast", *rate_args, "-g", str(fps * 2), "-pix_fmt", "yuv420p",
          "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-movflags", "+faststart", str(target)],
         source.name,
     ) and target.is_file()
 
 
 async def normalize_video(source: Path, target: Path) -> bool:
-    return await _encode(source, target, ["-crf", "21", "-maxrate", "6000k", "-bufsize", "12000k"])
+    fps = await _target_fps(source)
+    maxrate = 9000 if fps == HIGH_FPS else 6000
+    return await _encode(source, target, fps, ["-crf", "21", "-maxrate", f"{maxrate}k", "-bufsize", f"{maxrate * 2}k"])
 
 
 async def _fit_video(source: Path, target: Path) -> Path:
@@ -125,7 +150,7 @@ async def _fit_video(source: Path, target: Path) -> Path:
     if seconds:
         video_kbps = int(VIDEO_SIZE_LIMIT * 8 / seconds / 1000 * 0.95) - 128
         if video_kbps >= 300 and await _encode(
-            source, target,
+            source, target, await _target_fps(source),
             ["-b:v", f"{video_kbps}k", "-maxrate", f"{video_kbps}k", "-bufsize", f"{video_kbps * 2}k"],
         ):
             return target
@@ -133,12 +158,12 @@ async def _fit_video(source: Path, target: Path) -> Path:
 
 
 async def _normalize_submission_videos(core, submission_id: str, upload_root: Path) -> None:
-    """Replace each uploaded recording with its 30 fps MP4 so the app archive and the ZIP play smoothly."""
+    """Replace each uploaded recording with a constant frame rate MP4 so the app archive and the ZIP play smoothly."""
     with sqlite3.connect(core.STATE_DB) as conn:
         rows = conn.execute("SELECT slot,file_path FROM pti_photos WHERE submission_id=?", (submission_id,)).fetchall()
     for slot, filename in rows:
         source = upload_root / filename
-        if Path(filename).suffix.lower() not in VIDEO_SUFFIXES or filename.endswith(NORMALIZED_SUFFIX) or not source.is_file():
+        if Path(filename).suffix.lower() not in VIDEO_SUFFIXES or filename.endswith(NORMALIZED_SUFFIXES) or not source.is_file():
             continue
         target_name = f"{Path(filename).stem}{NORMALIZED_SUFFIX}"
         target = upload_root / target_name
