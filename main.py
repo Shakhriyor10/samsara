@@ -24,7 +24,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError, TelegramRetryAfter, TelegramServerError
 from aiogram.filters import Command
-from aiogram.types import BotCommand, BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, WebAppInfo
+from aiogram.types import BotCommand, BufferedInputFile, CallbackQuery, ChatMemberUpdated, InlineKeyboardButton, InlineKeyboardMarkup, Message, WebAppInfo
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -101,7 +101,7 @@ ACCOUNTS: tuple[SamsaraAccount, ...] = ()
 
 
 def account_label(account_id: str) -> str:
-    return {"1": "U.Z. Freight", "2": "Safe & SN"}.get(account_id, f"Samsara {account_id}")
+    return {"1": "U.Z. Freight", "2": "Safe & Secure"}.get(account_id, f"Samsara {account_id}")
 
 
 def configured_accounts() -> tuple[SamsaraAccount, ...]:
@@ -121,6 +121,9 @@ def utc_iso(value: datetime) -> str:
 
 def init_state() -> None:
     with sqlite3.connect(STATE_DB) as conn:
+        # WAL lets the bot and the Mini App API read while the other writes,
+        # and makes each small commit cheaper. The setting persists in the file.
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("CREATE TABLE IF NOT EXISTS sent_events (event_id TEXT PRIMARY KEY, sent_at TEXT NOT NULL)")
         conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         conn.execute("CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY, added_at TEXT NOT NULL)")
@@ -128,9 +131,20 @@ def init_state() -> None:
             "CREATE TABLE IF NOT EXISTS group_trucks (chat_id INTEGER NOT NULL, account_id TEXT NOT NULL, "
             "truck_id TEXT NOT NULL, truck_name TEXT NOT NULL, PRIMARY KEY(chat_id, account_id, truck_id))"
         )
+        # Telegram has no "list my chats" method, so the bot remembers the groups it is in.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS bot_groups (chat_id INTEGER PRIMARY KEY, title TEXT NOT NULL, "
+            "chat_type TEXT NOT NULL, is_member INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO bot_groups(chat_id, title, chat_type, is_member, updated_at) "
+            "SELECT DISTINCT chat_id, CAST(chat_id AS TEXT), 'supergroup', 1, ? FROM group_trucks",
+            (utc_iso(datetime.now(timezone.utc)),),
+        )
     with sqlite3.connect(STATE_DB) as conn:
         for user_id in bootstrap_admin_ids():
             conn.execute("INSERT OR IGNORE INTO admins(user_id, added_at) VALUES(?, ?)", (user_id, utc_iso(datetime.now(timezone.utc))))
+    reset_admin_cache()
 
 
 def bootstrap_admin_ids() -> set[int]:
@@ -146,11 +160,24 @@ def bootstrap_admin_ids() -> set[int]:
     return result
 
 
+_ADMIN_IDS: frozenset[int] | None = None
+
+
 def is_admin(user_id: int | None) -> bool:
+    # Checked on every command and Mini App request; the admins table changes
+    # only through /add_admin and /remove_admin, which reset this cache.
+    global _ADMIN_IDS
     if user_id is None:
         return False
-    with sqlite3.connect(STATE_DB) as conn:
-        return conn.execute("SELECT 1 FROM admins WHERE user_id = ?", (user_id,)).fetchone() is not None
+    if _ADMIN_IDS is None:
+        with sqlite3.connect(STATE_DB) as conn:
+            _ADMIN_IDS = frozenset(row[0] for row in conn.execute("SELECT user_id FROM admins"))
+    return user_id in _ADMIN_IDS
+
+
+def reset_admin_cache() -> None:
+    global _ADMIN_IDS
+    _ADMIN_IDS = None
 
 
 def is_linked_driver(user_id: int | None) -> bool:
@@ -163,6 +190,55 @@ def is_linked_driver(user_id: int | None) -> bool:
             ).fetchone() is not None
     except sqlite3.OperationalError:
         return False
+
+
+_KNOWN_BOT_GROUPS: dict[int, tuple[str, str, bool]] = {}
+
+
+def remember_bot_group(chat_id: int, title: str | None, chat_type: str, is_member: bool) -> None:
+    """Record a group the bot belongs to (or has left) so the Mini App can offer it in a picker."""
+    # Called for every group message: write only when something changed.
+    state = ((title or str(chat_id))[:255], chat_type, is_member)
+    if _KNOWN_BOT_GROUPS.get(chat_id) == state:
+        return
+    _KNOWN_BOT_GROUPS[chat_id] = state
+    with sqlite3.connect(STATE_DB) as conn:
+        conn.execute(
+            "INSERT INTO bot_groups(chat_id, title, chat_type, is_member, updated_at) VALUES(?, ?, ?, ?, ?) "
+            "ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title, chat_type=excluded.chat_type, "
+            "is_member=excluded.is_member, updated_at=excluded.updated_at",
+            (chat_id, state[0], chat_type, 1 if is_member else 0, utc_iso(datetime.now(timezone.utc))),
+        )
+
+
+def forget_bot_groups(chat_ids: list[int]) -> None:
+    """Drop cached group state after the Mini App marks groups as left."""
+    for chat_id in chat_ids:
+        _KNOWN_BOT_GROUPS.pop(chat_id, None)
+
+
+async def bot_membership_changed(update: ChatMemberUpdated) -> None:
+    chat = update.chat
+    if chat.type not in {"group", "supergroup"}:
+        return
+    is_member = update.new_chat_member.status in {"member", "administrator", "restricted"}
+    remember_bot_group(chat.id, chat.title, chat.type, is_member)
+    logger.info("Bot %s group %s (%s)", "joined" if is_member else "left", chat.id, chat.title)
+
+
+async def track_group_messages(handler, event: Message, data: dict[str, Any]):
+    """Outer middleware: any message the bot sees in a group keeps that group in the picker."""
+    try:
+        chat = event.chat
+        if chat.type in {"group", "supergroup"}:
+            if event.migrate_to_chat_id:
+                remember_bot_group(chat.id, chat.title, chat.type, False)
+                remember_bot_group(event.migrate_to_chat_id, chat.title, "supergroup", True)
+            elif event.left_chat_member is None or event.left_chat_member.id != event.bot.id:
+                remember_bot_group(chat.id, chat.title, chat.type, True)
+    except Exception:
+        logger.exception("Could not record Telegram group %s", getattr(event.chat, "id", "?"))
+    return await handler(event, data)
 
 
 def configured_trucks(chat_id: int, account_id: str | None = None) -> list[dict[str, str]]:
@@ -217,19 +293,40 @@ def mark_sent(event_id: str) -> None:
         )
 
 
-async def get_events(session: aiohttp.ClientSession, account: SamsaraAccount, start: datetime, end: datetime) -> list[dict[str, Any]]:
+_SAMSARA_SESSION: aiohttp.ClientSession | None = None
+
+
+def samsara_session() -> aiohttp.ClientSession:
+    """Shared HTTP session so Samsara calls reuse keep-alive TLS connections."""
+    global _SAMSARA_SESSION
+    if _SAMSARA_SESSION is None or _SAMSARA_SESSION.closed:
+        _SAMSARA_SESSION = aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(limit=20, ttl_dns_cache=300, keepalive_timeout=60)
+        )
+    return _SAMSARA_SESSION
+
+
+async def close_samsara_session() -> None:
+    global _SAMSARA_SESSION
+    if _SAMSARA_SESSION is not None and not _SAMSARA_SESSION.closed:
+        await _SAMSARA_SESSION.close()
+    _SAMSARA_SESSION = None
+
+
+async def get_paginated(
+    url: str,
+    account: SamsaraAccount,
+    params: dict[str, str],
+    timeout: aiohttp.ClientTimeout,
+    session: aiohttp.ClientSession | None = None,
+) -> list[dict[str, Any]]:
+    """Collect every page of a Samsara list endpoint."""
+    session = session or samsara_session()
     headers = {"Authorization": f"Bearer {account.api_key}", "Accept": "application/json"}
-    params: dict[str, str] = {
-        "startTime": utc_iso(start),
-        "endTime": utc_iso(end),
-        "queryByTimeField": "updatedAtTime",
-        "behaviorLabels": "Braking",
-        "includeAsset": "true",
-        "includeDriver": "true",
-    }
+    params = dict(params)
     results: list[dict[str, Any]] = []
     while True:
-        async with session.get(API_URL, headers=headers, params=params) as response:
+        async with session.get(url, headers=headers, params=params, timeout=timeout) as response:
             body = await response.json(content_type=None)
             if response.status >= 400:
                 raise RuntimeError(f"Samsara API returned HTTP {response.status}: {body}")
@@ -241,6 +338,18 @@ async def get_events(session: aiohttp.ClientSession, account: SamsaraAccount, st
     return results
 
 
+async def get_events(session: aiohttp.ClientSession, account: SamsaraAccount, start: datetime, end: datetime) -> list[dict[str, Any]]:
+    params: dict[str, str] = {
+        "startTime": utc_iso(start),
+        "endTime": utc_iso(end),
+        "queryByTimeField": "updatedAtTime",
+        "behaviorLabels": "Braking",
+        "includeAsset": "true",
+        "includeDriver": "true",
+    }
+    return await get_paginated(API_URL, account, params, aiohttp.ClientTimeout(total=45), session)
+
+
 async def get_braking_events(
     account: SamsaraAccount,
     start: datetime,
@@ -248,7 +357,6 @@ async def get_braking_events(
     vehicle_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Fetch braking events detected during a caller-selected time range."""
-    headers = {"Authorization": f"Bearer {account.api_key}", "Accept": "application/json"}
     params: dict[str, str] = {
         "startTime": utc_iso(start),
         "endTime": utc_iso(end),
@@ -259,19 +367,7 @@ async def get_braking_events(
     }
     if vehicle_id:
         params["assetIds"] = str(vehicle_id)
-    events: list[dict[str, Any]] = []
-    timeout = aiohttp.ClientTimeout(total=90)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        while True:
-            async with session.get(API_URL, headers=headers, params=params) as response:
-                body = await response.json(content_type=None)
-                if response.status >= 400:
-                    raise RuntimeError(f"Samsara API returned HTTP {response.status}: {body}")
-            events.extend(item for item in body.get("data", []) if isinstance(item, dict))
-            pagination = body.get("pagination", {})
-            if not pagination.get("hasNextPage") or not pagination.get("endCursor"):
-                break
-            params["after"] = pagination["endCursor"]
+    events = await get_paginated(API_URL, account, params, aiohttp.ClientTimeout(total=90))
     events.sort(key=lambda item: event_timestamp(item) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
     return events
 
@@ -290,22 +386,7 @@ async def get_braking_history(
 
 async def get_truck_locations(account: SamsaraAccount) -> list[dict[str, Any]]:
     """Return the latest GPS snapshot for each vehicle in the organization."""
-    headers = {"Authorization": f"Bearer {account.api_key}", "Accept": "application/json"}
-    params: dict[str, str] = {"types": "gps"}
-    trucks: list[dict[str, Any]] = []
-    timeout = aiohttp.ClientTimeout(total=45)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        while True:
-            async with session.get(VEHICLE_STATS_URL, headers=headers, params=params) as response:
-                body = await response.json(content_type=None)
-                if response.status >= 400:
-                    raise RuntimeError(f"Samsara API returned HTTP {response.status}: {body}")
-            trucks.extend(item for item in body.get("data", []) if isinstance(item, dict))
-            pagination = body.get("pagination", {})
-            if not pagination.get("hasNextPage") or not pagination.get("endCursor"):
-                break
-            params["after"] = pagination["endCursor"]
-    return trucks
+    return await get_paginated(VEHICLE_STATS_URL, account, {"types": "gps"}, aiohttp.ClientTimeout(total=45))
 
 
 def truck_line(truck: dict[str, Any]) -> str:
@@ -1494,6 +1575,7 @@ async def add_admin_command(message: Message) -> None:
         return
     with sqlite3.connect(STATE_DB) as conn:
         conn.execute("INSERT OR IGNORE INTO admins(user_id, added_at) VALUES(?, ?)", (user_id, utc_iso(datetime.now(timezone.utc))))
+    reset_admin_cache()
     await message.answer(f"✅ User <code>{user_id}</code> is now a bot administrator.")
 
 
@@ -1512,6 +1594,7 @@ async def remove_admin_command(message: Message) -> None:
         return
     with sqlite3.connect(STATE_DB) as conn:
         conn.execute("DELETE FROM admins WHERE user_id = ?", (user_id,))
+    reset_admin_cache()
     await message.answer(f"✅ Administrator access was removed from user <code>{user_id}</code>.")
 
 
@@ -1958,6 +2041,8 @@ async def main() -> None:
         logger.warning("No bot admins configured; use /myid, add that ID to BOT_ADMIN_IDS, and restart the bot")
     bot = Bot(TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dispatcher = Dispatcher()
+    dispatcher.message.outer_middleware(track_group_messages)
+    dispatcher.my_chat_member.register(bot_membership_changed)
     dispatcher.message.register(app_command, Command("app"))
     dispatcher.message.register(start_command, Command("start"))
     dispatcher.message.register(my_id_command, Command("myid"))
@@ -1993,6 +2078,7 @@ async def main() -> None:
         await asyncio.gather(dispatcher.start_polling(bot), *workers)
     finally:
         await web_runner.cleanup()
+        await close_samsara_session()
         await bot.session.close()
 
 

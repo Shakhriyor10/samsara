@@ -18,6 +18,7 @@ from urllib.parse import parse_qsl
 
 from aiohttp import web
 from aiogram import Bot
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 
 
@@ -500,7 +501,7 @@ async def api_trucks(request: web.Request) -> web.Response:
                 "id": vehicle_id,
                 "name": str(vehicle.get("name") or f"Truck {vehicle_id}"),
                 "accountId": account.account_id,
-                "company": ("U.Z. Freight" if account.account_id == "1" else "Safe & SN"),
+                "company": ("U.Z. Freight" if account.account_id == "1" else "Safe & Secure"),
                 "driver": str(driver.get("name") or vehicle.get("driverName") or ""),
                 "location": location or "Location unavailable",
                 "latitude": gps.get("latitude"),
@@ -536,6 +537,7 @@ async def api_attach_driver(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest(text="A bot administrator account cannot be assigned as a driver")
     telegram_name = str(payload.get("name") or "Driver").strip()[:100] or "Driver"
     truck_name = str(payload.get("truckName") or vehicle_id).strip()[:160]
+    replace_existing = payload.get("replace") is True
     linked_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     with sqlite3.connect(core.STATE_DB) as conn:
         existing_user = conn.execute(
@@ -547,7 +549,9 @@ async def api_attach_driver(request: web.Request) -> web.Response:
         if existing_user and (existing_user[0], existing_user[1]) != (account_id, vehicle_id):
             raise web.HTTPConflict(text="This Telegram user is already linked to another truck. Unlink it first.")
         if existing_truck and int(existing_truck[0]) != telegram_user_id:
-            raise web.HTTPConflict(text="This truck is already linked to another Telegram user. Unlink it first.")
+            if not replace_existing:
+                raise web.HTTPConflict(text="This truck is already linked to another Telegram user. Unlink it first.")
+            conn.execute("DELETE FROM driver_accounts WHERE account_id=? AND truck_id=?", (account_id, vehicle_id))
         conn.execute(
             "INSERT INTO driver_accounts(telegram_user_id,telegram_name,account_id,truck_id,truck_name,linked_at) "
             "VALUES(?,?,?,?,?,?) ON CONFLICT(telegram_user_id) DO UPDATE SET "
@@ -630,7 +634,7 @@ async def api_pti_settings(request: web.Request) -> web.Response:
         driver_items.append({
             "telegramUserId": str(user_id), "name": name, "accountId": account_id,
             "truckId": truck_id, "truckName": truck_name,
-            "company": "U.Z. Freight" if account_id == "1" else "Safe & SN",
+            "company": "U.Z. Freight" if account_id == "1" else "Safe & Secure",
             "submissionId": last_id, "lastSubmittedAt": submitted_at,
             "invalidationReason": invalidation_reason, **timing,
         })
@@ -664,7 +668,7 @@ def pti_status_payload(core, user_id: int, link: dict) -> dict:
     return {
         "truck": {
             "accountId": link["account_id"], "truckId": link["truck_id"], "name": link["truck_name"],
-            "company": "U.Z. Freight" if link["account_id"] == "1" else "Safe & SN",
+            "company": "U.Z. Freight" if link["account_id"] == "1" else "Safe & Secure",
         },
         "intervalHours": interval_hours,
         "lastSubmittedAt": latest["submitted_at"] if latest else None,
@@ -930,6 +934,25 @@ async def api_pti_photo(request: web.Request) -> web.StreamResponse:
     return web.FileResponse(path, headers={"Cache-Control": "private, no-store"})
 
 
+def telegram_group_id_candidates(value) -> list[int]:
+    """Possible chat IDs for what the admin entered or picked.
+
+    Basic groups have short IDs (-5466053620) and supergroups have -100 IDs
+    (-1004395204819), so a value is tried exactly as given first and only then
+    with the -100 prefix added or removed.
+    """
+    raw = str(value or "").strip().replace(" ", "")
+    digits = raw.lstrip("-")
+    if not digits.isdigit() or not 4 <= len(digits) <= 18:
+        raise web.HTTPBadRequest(text="Enter a valid Telegram group ID")
+    candidates = [-int(digits)]
+    if digits.startswith("100") and len(digits) > 12:
+        candidates.append(-int(digits[3:]))
+    elif len(digits) + 3 <= 18:
+        candidates.append(-int("100" + digits))
+    return candidates
+
+
 def normalize_telegram_group_id(value) -> int:
     raw = str(value or "").strip().replace(" ", "")
     digits = raw.lstrip("-")
@@ -939,6 +962,42 @@ def normalize_telegram_group_id(value) -> int:
     if len(normalized) > 18:
         raise web.HTTPBadRequest(text="Telegram group ID is too long")
     return -int(normalized)
+
+
+async def api_bot_groups(request: web.Request) -> web.Response:
+    """Groups the bot is known to be a member of, for the "Choose a group" picker."""
+    await require_admin(request)
+    core = request.app["core"]
+    bot: Bot = request.app["bot"]
+    with sqlite3.connect(core.STATE_DB) as conn:
+        rows = conn.execute(
+            "SELECT chat_id, title FROM bot_groups WHERE is_member=1 ORDER BY title COLLATE NOCASE"
+        ).fetchall()
+
+    async def resolve(chat_id: int, stored_title: str):
+        cached = CHAT_TITLE_CACHE.get(chat_id)
+        if cached and time.monotonic() - cached[0] < CHAT_TITLE_CACHE_SECONDS:
+            return chat_id, cached[1]
+        try:
+            chat = await bot.get_chat(chat_id)
+        except (TelegramForbiddenError, TelegramBadRequest):
+            return chat_id, None  # The bot was removed or the group no longer exists.
+        except Exception:
+            logger.info("Could not refresh Telegram group %s", chat_id, exc_info=True)
+            return chat_id, stored_title
+        title = chat.title or stored_title
+        CHAT_TITLE_CACHE[chat_id] = (time.monotonic(), title)
+        return chat_id, title
+
+    resolved = await asyncio.gather(*(resolve(int(chat_id), title) for chat_id, title in rows))
+    gone = [chat_id for chat_id, title in resolved if title is None]
+    if gone:
+        with sqlite3.connect(core.STATE_DB) as conn:
+            conn.executemany("UPDATE bot_groups SET is_member=0 WHERE chat_id=?", [(chat_id,) for chat_id in gone])
+        core.forget_bot_groups(gone)
+    groups = [{"id": str(chat_id), "name": title} for chat_id, title in resolved if title is not None]
+    groups.sort(key=lambda item: item["name"].casefold())
+    return web.json_response({"groups": groups})
 
 
 async def api_add_truck_group(request: web.Request) -> web.Response:
@@ -954,25 +1013,44 @@ async def api_add_truck_group(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest(text="Invalid request body") from error
     if not isinstance(payload, dict):
         raise web.HTTPBadRequest(text="Invalid request body")
-    chat_id = normalize_telegram_group_id(payload.get("groupId"))
     bot: Bot = request.app["bot"]
-    try:
-        chat = await bot.get_chat(chat_id)
-    except Exception as error:
+    chat = None
+    for candidate in telegram_group_id_candidates(payload.get("groupId")):
+        try:
+            chat = await bot.get_chat(candidate)
+            break
+        except Exception:
+            logger.info("Telegram group lookup failed for %s", candidate, exc_info=True)
+    if chat is None:
         raise web.HTTPBadRequest(
             text="The bot cannot access this group. Add the bot to the group and try again."
-        ) from error
+        )
+    chat_id = int(chat.id)
     if getattr(chat, "type", None) not in {"group", "supergroup"}:
         raise web.HTTPBadRequest(text="This Telegram chat is not a group")
 
     truck_name = str(payload.get("truckName") or vehicle_id).strip()[:160]
+    title = chat.title or chat.full_name or str(chat_id)
     with sqlite3.connect(core.STATE_DB) as conn:
-        conn.execute(
+        cursor = conn.execute(
             "INSERT OR IGNORE INTO group_trucks(chat_id, account_id, truck_id, truck_name) VALUES(?, ?, ?, ?)",
             (chat_id, account_id, vehicle_id, truck_name),
         )
-    title = chat.title or chat.full_name or str(chat_id)
-    return web.json_response({"group": {"id": str(chat_id), "name": title}})
+        newly_linked = cursor.rowcount == 1
+    core.remember_bot_group(chat_id, title, chat.type, True)
+
+    notified = False
+    if newly_linked:
+        text = (
+            f"✅ <b>{html.escape(truck_name)}</b> ({html.escape(core.account_label(account_id))}) "
+            "is now linked to this group.\nSafety alerts for this truck will be posted here."
+        )
+        try:
+            await bot.send_message(chat_id, text, parse_mode="HTML")
+            notified = True
+        except Exception:
+            logger.warning("Linked truck %s to group %s but could not post the notice", vehicle_id, chat_id, exc_info=True)
+    return web.json_response({"group": {"id": str(chat_id), "name": title}, "notified": notified})
 
 
 async def api_remove_truck_group(request: web.Request) -> web.Response:
@@ -1400,6 +1478,7 @@ def create_app(bot: Bot, core) -> web.Application:
     app.router.add_get("/", index)
     app.router.add_get("/api/me", api_me)
     app.router.add_get("/api/trucks", api_trucks)
+    app.router.add_get("/api/groups", api_bot_groups)
     app.router.add_post("/api/trucks/{account_id}/{vehicle_id}/driver", api_attach_driver)
     app.router.add_delete("/api/trucks/{account_id}/{vehicle_id}/driver", api_remove_driver)
     app.router.add_post("/api/trucks/{account_id}/{vehicle_id}/pti/notify", api_notify_truck_driver)
