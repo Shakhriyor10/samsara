@@ -30,6 +30,9 @@ PTI_PHOTO_RETENTION_DAYS = 15
 EVENT_VIDEO_CACHE_DAYS = 6
 EVENT_VIDEO_CACHE_TASKS: dict[str, asyncio.Task] = {}
 EVENT_VIDEO_CACHE_RETRY_AFTER: dict[str, float] = {}
+CHAT_TITLE_CACHE_SECONDS = 10 * 60
+CHAT_TITLE_CACHE: dict[int, tuple[float, str]] = {}
+COMPRESSIBLE_MIN_BYTES = 1024
 
 
 def cleanup_expired_pti_photos(core) -> int:
@@ -327,8 +330,45 @@ async def require_user(request: web.Request) -> tuple[dict, str, dict | None]:
     return user, "driver", link
 
 
-async def index(_: web.Request) -> web.FileResponse:
-    return web.FileResponse(WEB_ROOT / "index.html")
+INDEX_CACHE: dict[str, object] = {}
+
+
+def load_index_html() -> tuple[str, str]:
+    """Return index.html and its ETag, re-reading the file only after it changes."""
+    path = WEB_ROOT / "index.html"
+    stat = path.stat()
+    signature = (stat.st_mtime_ns, stat.st_size)
+    if INDEX_CACHE.get("signature") != signature:
+        text = path.read_text(encoding="utf-8")
+        INDEX_CACHE.update(
+            signature=signature,
+            text=text,
+            etag='"' + hashlib.sha256(text.encode()).hexdigest()[:20] + '"',
+        )
+    return INDEX_CACHE["text"], INDEX_CACHE["etag"]
+
+
+async def index(request: web.Request) -> web.Response:
+    text, etag = await asyncio.to_thread(load_index_html)
+    headers = {"ETag": etag, "Cache-Control": "no-cache"}
+    if request.headers.get("If-None-Match") == etag:
+        return web.Response(status=304, headers=headers)
+    return web.Response(text=text, content_type="text/html", headers=headers)
+
+
+@web.middleware
+async def compression_middleware(request: web.Request, handler):
+    """Gzip HTML and JSON responses; Telegram WebViews on mobile data benefit most."""
+    response = await handler(request)
+    if (
+        type(response) is web.Response
+        and response.content_type in {"application/json", "text/html"}
+        and response.body is not None
+        and len(response.body) >= COMPRESSIBLE_MIN_BYTES
+        and "gzip" in request.headers.get("Accept-Encoding", "")
+    ):
+        response.enable_compression(web.ContentCoding.gzip)
+    return response
 
 
 async def api_me(request: web.Request) -> web.Response:
@@ -355,9 +395,16 @@ def assigned_groups(core, account_id: str, vehicle_id: str) -> list[tuple[int, s
 
 
 async def chat_title(bot: Bot, chat_id: int, fallback: str) -> str:
+    # The truck list resolves every assigned group on each sync; cache titles
+    # so repeated syncs do not hit Telegram's getChat rate limits.
+    cached = CHAT_TITLE_CACHE.get(chat_id)
+    if cached and time.monotonic() - cached[0] < CHAT_TITLE_CACHE_SECONDS:
+        return cached[1]
     try:
         chat = await bot.get_chat(chat_id)
-        return chat.title or chat.full_name or chat.username or fallback
+        title = chat.title or chat.full_name or chat.username or fallback
+        CHAT_TITLE_CACHE[chat_id] = (time.monotonic(), title)
+        return title
     except Exception:
         logger.info("Could not resolve Telegram group title for %s", chat_id, exc_info=True)
         return fallback
@@ -415,18 +462,31 @@ async def api_trucks(request: web.Request) -> web.Response:
         group_id = int(chat_id)
         assignments.setdefault((str(account_id), str(truck_id)), []).append((group_id, str(group_id)))
         all_groups[group_id] = str(group_id)
-    resolved_names = await asyncio.gather(
-        *(chat_title(bot, group_id, fallback) for group_id, fallback in all_groups.items())
-    )
-    group_names = dict(zip(all_groups, resolved_names))
-    result: list[dict] = []
-    for account in core.ACCOUNTS:
-        if company_filter != "all" and account.account_id != company_filter:
-            continue
+    async def fetch_locations(account):
         try:
-            vehicles = await core.get_truck_locations(account)
+            return await core.get_truck_locations(account)
         except Exception:
             logger.exception("Could not fetch vehicles for Samsara account %s", account.account_id)
+            return None
+
+    accounts = [
+        account for account in core.ACCOUNTS
+        if company_filter == "all" or account.account_id == company_filter
+    ]
+
+    async def resolve_group_names():
+        resolved = await asyncio.gather(
+            *(chat_title(bot, group_id, fallback) for group_id, fallback in all_groups.items())
+        )
+        return dict(zip(all_groups, resolved))
+
+    group_names, vehicle_lists = await asyncio.gather(
+        resolve_group_names(),
+        asyncio.gather(*(fetch_locations(account) for account in accounts)),
+    )
+    result: list[dict] = []
+    for account, vehicles in zip(accounts, vehicle_lists):
+        if vehicles is None:
             continue
         for vehicle in vehicles:
             vehicle_id = str(vehicle.get("id", ""))
@@ -966,24 +1026,7 @@ async def api_truck_events(request: web.Request) -> web.Response:
         stamp = core.event_timestamp(event)
         if not stamp or not (start <= stamp < end):
             return
-        location = core.event_location_text(event)
-        coords = event.get("location") if isinstance(event.get("location"), dict) else {}
-        driver = event.get("driver") if isinstance(event.get("driver"), dict) else {}
-        recent.append({
-            "id": core.event_id(event),
-            "accountId": account_id,
-            "truckId": vehicle_id,
-            "truckName": str(((event.get("asset") or event.get("vehicle") or {}).get("name") if isinstance(event.get("asset") or event.get("vehicle") or {}, dict) else "") or f"Truck {vehicle_id}"),
-            "eventDate": stamp.astimezone(core.ZoneInfo(core.EVENT_TIMEZONE)).date().isoformat(),
-            "time": core.format_event_time(event),
-            "location": location or "Location unavailable",
-            "mapUrl": (
-                f"https://maps.google.com/?q={coords['latitude']},{coords['longitude']}"
-                if coords.get("latitude") is not None and coords.get("longitude") is not None else None
-            ),
-            "driver": str(driver.get("name") or event.get("driverName") or "Driver not assigned"),
-            "type": "Harsh braking",
-        })
+        recent.append(format_alert_event(core, event, account_id, vehicle_id))
 
     for event in events:
         append_matching_event(event)
@@ -1081,17 +1124,23 @@ async def api_alerts(request: web.Request) -> web.Response:
 
     results: list[dict] = []
     cache_candidates: dict[tuple[str, str, str, str], tuple[object, dict]] = {}
-    for account in core.ACCOUNTS:
-        if selected_account_id and account.account_id != selected_account_id:
-            continue
+    accounts = [
+        account for account in core.ACCOUNTS
+        if not selected_account_id or account.account_id == selected_account_id
+    ]
+
+    async def fetch_events(account):
         try:
-            events = await core.get_braking_events(
+            return await core.get_braking_events(
                 account, start, end,
                 selected_vehicle_id if account.account_id == selected_account_id else None,
             )
         except Exception as error:
             logger.exception("Could not search Samsara alerts for account %s", account.account_id)
             raise web.HTTPBadGateway(text=f"Could not load alerts for {core.account_label(account.account_id)}: {error}") from error
+
+    event_lists = await asyncio.gather(*(fetch_events(account) for account in accounts))
+    for account, events in zip(accounts, event_lists):
         for event in events:
             vehicle_id = event_vehicle_id(core, event)
             stamp = core.event_timestamp(event)
@@ -1140,12 +1189,15 @@ async def api_live_alerts(request: web.Request) -> web.Response:
     start = max(since.astimezone(timezone.utc) - timedelta(minutes=10), now - timedelta(days=1))
     results: list[dict] = []
     cache_candidates: dict[tuple[str, str, str, str], tuple[object, dict]] = {}
-    for account in core.ACCOUNTS:
+    async def fetch_events(account):
         try:
-            events = await core.get_braking_events(account, start, now)
+            return await core.get_braking_events(account, start, now)
         except Exception as error:
             logger.exception("Could not poll live safety events for account %s", account.account_id)
             raise web.HTTPBadGateway(text=f"Could not refresh alerts for {core.account_label(account.account_id)}") from error
+
+    event_lists = await asyncio.gather(*(fetch_events(account) for account in core.ACCOUNTS))
+    for account, events in zip(core.ACCOUNTS, event_lists):
         for event in events:
             vehicle_id = event_vehicle_id(core, event)
             stamp = core.event_timestamp(event)
@@ -1338,7 +1390,7 @@ async def api_event_video(request: web.Request) -> web.Response:
 
 def create_app(bot: Bot, core) -> web.Application:
     ensure_pti_schema(core)
-    app = web.Application(client_max_size=32 * 1024 * 1024)
+    app = web.Application(client_max_size=32 * 1024 * 1024, middlewares=[compression_middleware])
     app["bot"] = bot
     app["core"] = core
     app["event_video_cache_tasks"] = EVENT_VIDEO_CACHE_TASKS
