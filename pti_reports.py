@@ -163,7 +163,7 @@ def _load_submission(core, submission_id: str) -> tuple[dict, list[dict], list[t
         "truck": row[6], "company": core.account_label(row[1]), "driver": row[7] or "Driver",
         "driver_id": row[0], "submitted": local.strftime("%b %d, %Y %I:%M %p %Z"),
         "stamp": local.strftime("%Y-%m-%d_%H%M"), "mode": mode,
-        "mode_label": {"photo": "Photo checklist", "video": "Walk-around video", "both": "Photo checklist + walk-around video"}[mode],
+        "mode_label": {"photo": "Photos", "video": "Walk-around video", "both": "Photos + walk-around video"}[mode],
     }
     items = submission_items({slot for slot, _ in media}, json.loads(row[5] or "{}"))
     return meta, items, media, chat_id
