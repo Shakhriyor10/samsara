@@ -1,10 +1,10 @@
 """PTI steps: stored in the database so admins can add, edit, remove and reorder them in the Mini App.
 
-Each step is a photo or a video. A truck's PTI options pick which of them its driver takes:
-"photos" includes every photo step, "video" every video step, always in the admin's order.
+Each step is a photo or a video. Every truck's PTI follows all steps, in the admin's order.
 
 ``icon`` is "diagram:<view>" for one of the Mini App's built-in camera-position drawings
-(front, rear, driver_side, passenger_side, cabin, dashboard) or "lucide:<Name>" for a Lucide icon.
+(front, rear, driver_side, passenger_side, cabin, dashboard), "lucide:<Name>" for a Lucide icon,
+or "image:<file>" for a square picture an admin uploaded (see miniapp_server.api_upload_step_image).
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ SECTION_TITLES = {"photo": "Photos", "video": "Videos"}
 MAX_STEPS = 60
 DEFAULT_VIDEO_SECONDS = 90
 VIDEO_SECONDS_RANGE = (5, 300)
-ICON_PATTERN = re.compile(r"^(diagram:[a-z_]{2,20}|lucide:[A-Za-z0-9]{2,60})$")
+ICON_PATTERN = re.compile(r"^(diagram:[a-z_]{2,20}|lucide:[A-Za-z0-9]{2,60}|image:[0-9a-f]{32}\.(?:png|jpg))$")
 
 # The PTI before steps became editable; it seeds the table on first start.
 DEFAULT_STEPS: list[dict[str, Any]] = [
@@ -70,13 +70,10 @@ def load_steps(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     return steps
 
 
-def steps_for_mode(steps: list[dict[str, Any]], photos: bool, video: bool) -> list[dict[str, Any]]:
-    """Steps a driver completes for a truck's PTI options, in the admin's order."""
-    return [step for step in steps if (step["kind"] == "photo" and photos) or (step["kind"] == "video" and video)]
-
-
-def mode_name(photos: bool, video: bool) -> str:
-    return "both" if photos and video else "video" if video else "photo"
+def mode_name(steps: list[dict[str, Any]]) -> str:
+    """What a PTI contains, for the report caption: photos, videos or both."""
+    kinds = {step["kind"] for step in steps}
+    return "both" if kinds == KINDS else "video" if kinds == {"video"} else "photo"
 
 
 def clean_steps(items: Any) -> list[dict[str, Any]]:

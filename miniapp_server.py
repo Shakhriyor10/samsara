@@ -8,7 +8,10 @@ import hmac
 import html
 import json
 import logging
+import io
 import os
+import re
+import secrets
 import sqlite3
 import time
 import uuid
@@ -273,12 +276,6 @@ def ensure_pti_schema(core) -> None:
         pti_checklist.ensure_steps_table(conn)
         conn.execute(
             "INSERT OR IGNORE INTO pti_settings(key, value) VALUES('reminder_hours', '2')"
-        )
-        # Which parts of the PTI each truck requires; trucks without a row use photos only.
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS pti_truck_modes (account_id TEXT NOT NULL, truck_id TEXT NOT NULL, "
-            "photos INTEGER NOT NULL DEFAULT 1, video INTEGER NOT NULL DEFAULT 0, "
-            "PRIMARY KEY(account_id, truck_id))"
         )
         conn.execute(
             "CREATE TABLE IF NOT EXISTS pti_reports (submission_id TEXT PRIMARY KEY, chat_id INTEGER, "
@@ -638,13 +635,6 @@ def save_pti_setting(conn: sqlite3.Connection, key: str, value: str) -> None:
     )
 
 
-def truck_pti_mode(conn: sqlite3.Connection, account_id: str, truck_id: str) -> tuple[bool, bool]:
-    row = conn.execute(
-        "SELECT photos, video FROM pti_truck_modes WHERE account_id=? AND truck_id=?", (account_id, truck_id)
-    ).fetchone()
-    return (bool(row[0]), bool(row[1])) if row else (True, False)
-
-
 async def resolve_report_group(bot: Bot, value) -> tuple[int, str, str]:
     """Check that the bot can post in the group an admin picked or typed."""
     for candidate in telegram_group_id_candidates(value):
@@ -685,10 +675,6 @@ async def api_pti_settings(request: web.Request) -> web.Response:
             save_pti_setting(conn, "report_chat_title", report_group[1] if report_group else "")
     with sqlite3.connect(core.STATE_DB) as conn:
         settings = read_pti_settings(conn)
-        modes = {
-            (str(row[0]), str(row[1])): (bool(row[2]), bool(row[3]))
-            for row in conn.execute("SELECT account_id, truck_id, photos, video FROM pti_truck_modes")
-        }
         linked = conn.execute("SELECT COUNT(*) FROM driver_accounts").fetchone()[0]
         drivers = conn.execute(
             "SELECT d.telegram_user_id,d.telegram_name,d.account_id,d.truck_id,d.truck_name,d.linked_at,"
@@ -707,13 +693,12 @@ async def api_pti_settings(request: web.Request) -> web.Response:
     driver_items = []
     for user_id, name, account_id, truck_id, truck_name, linked_at, last_id, submitted_at, invalidated_at, invalidation_reason in drivers:
         timing = pti_timing(submitted_at or linked_at, interval_hours, now, invalidated_at, first_submission=not submitted_at)
-        photos, video = modes.get((str(account_id), str(truck_id)), (True, False))
         driver_items.append({
             "telegramUserId": str(user_id), "name": name, "accountId": account_id,
             "truckId": truck_id, "truckName": truck_name,
             "company": "U.Z. Freight" if account_id == "1" else "Safe & Secure",
             "submissionId": last_id, "lastSubmittedAt": submitted_at,
-            "invalidationReason": invalidation_reason, "ptiPhotos": photos, "ptiVideo": video, **timing,
+            "invalidationReason": invalidation_reason, **timing,
         })
     report_group = (
         {"id": str(settings["reportChatId"]), "name": settings["reportChatTitle"] or str(settings["reportChatId"])}
@@ -722,10 +707,6 @@ async def api_pti_settings(request: web.Request) -> web.Response:
     return web.json_response({
         "intervalHours": interval_hours, "reminderHours": settings["reminderHours"],
         "reportGroup": report_group, "linkedDrivers": linked, "drivers": driver_items,
-        "modes": [
-            {"accountId": key[0], "truckId": key[1], "photos": value[0], "video": value[1]}
-            for key, value in modes.items()
-        ],
     })
 
 
@@ -743,33 +724,85 @@ async def api_pti_steps(request: web.Request) -> web.Response:
                 steps = pti_checklist.save_steps(conn, payload.get("steps") if isinstance(payload, dict) else None)
         except ValueError as error:
             raise web.HTTPBadRequest(text=str(error)) from error
+        await asyncio.to_thread(remove_unused_step_images, core, steps)
     else:
         with sqlite3.connect(core.STATE_DB) as conn:
             steps = pti_checklist.load_steps(conn)
     return web.json_response({"steps": steps})
 
 
-async def api_truck_pti_mode(request: web.Request) -> web.Response:
-    await require_admin(request)
-    core = request.app["core"]
-    account_id, truck_id = request.match_info["account_id"], request.match_info["vehicle_id"]
-    if not any(item.account_id == account_id for item in core.ACCOUNTS):
-        raise web.HTTPNotFound(text="Company not found")
+# Square pictures admins upload for PTI steps. They are illustrations, not inspection evidence, so they
+# are served without Telegram auth (an <img> cannot send headers) under random, unguessable names.
+STEP_IMAGE_SIZE = 512
+STEP_IMAGE_MAX_BYTES = 8 * 1024 * 1024
+STEP_IMAGE_NAME = re.compile(r"^[0-9a-f]{32}\.(?:png|jpg)$")
+
+
+def step_image_root(core) -> Path:
+    return Path(core_state_path(core)) / "pti_step_images"
+
+
+def save_step_image(core, content: bytes) -> str:
+    """Re-encode an uploaded picture as a 512 px square; keeps transparency as PNG, otherwise JPEG."""
+    from PIL import Image, ImageOps, UnidentifiedImageError
+
     try:
-        payload = await request.json()
-    except (json.JSONDecodeError, web.HTTPBadRequest) as error:
-        raise web.HTTPBadRequest(text="Invalid request body") from error
-    photos = bool(payload.get("photos")) if isinstance(payload, dict) else False
-    video = bool(payload.get("video")) if isinstance(payload, dict) else False
-    if not photos and not video:
-        raise web.HTTPBadRequest(text="Keep photos or video enabled for this truck's PTI")
-    with sqlite3.connect(core.STATE_DB) as conn:
-        conn.execute(
-            "INSERT INTO pti_truck_modes(account_id, truck_id, photos, video) VALUES(?,?,?,?) "
-            "ON CONFLICT(account_id, truck_id) DO UPDATE SET photos=excluded.photos, video=excluded.video",
-            (account_id, truck_id, int(photos), int(video)),
-        )
-    return web.json_response({"accountId": account_id, "truckId": truck_id, "photos": photos, "video": video})
+        with Image.open(io.BytesIO(content)) as source:
+            image = ImageOps.exif_transpose(source)
+            image.load()
+    except (UnidentifiedImageError, OSError) as error:
+        raise web.HTTPBadRequest(text="This file is not a supported image (JPEG, PNG or WebP)") from error
+    # The app already crops to a square; center-crop here too in case a client did not.
+    side = min(image.size)
+    left, top = (image.width - side) // 2, (image.height - side) // 2
+    image = image.crop((left, top, left + side, top + side))
+    if side > STEP_IMAGE_SIZE:
+        image = image.resize((STEP_IMAGE_SIZE, STEP_IMAGE_SIZE), Image.LANCZOS)
+    has_alpha = image.mode in {"RGBA", "LA"} or (image.mode == "P" and "transparency" in image.info)
+    name = f"{secrets.token_hex(16)}.{'png' if has_alpha else 'jpg'}"
+    root = step_image_root(core)
+    root.mkdir(parents=True, exist_ok=True)
+    if has_alpha:
+        image.convert("RGBA").save(root / name, "PNG", optimize=True)
+    else:
+        image.convert("RGB").save(root / name, "JPEG", quality=90, optimize=True)
+    return name
+
+
+def remove_unused_step_images(core, steps: list[dict]) -> None:
+    """Delete pictures no step uses; fresh uploads get an hour, since the step is saved after the upload."""
+    root = step_image_root(core)
+    if not root.is_dir():
+        return
+    used = {step["icon"].split(":", 1)[1] for step in steps if step["icon"].startswith("image:")}
+    cutoff = time.time() - 3600
+    for path in root.iterdir():
+        if path.name not in used and STEP_IMAGE_NAME.match(path.name) and path.stat().st_mtime < cutoff:
+            path.unlink(missing_ok=True)
+
+
+async def api_upload_step_image(request: web.Request) -> web.Response:
+    await require_admin(request)
+    reader = await request.multipart()
+    part = await reader.next()
+    if part is None or part.name != "image":
+        raise web.HTTPBadRequest(text="Choose an image to upload")
+    content = bytearray()
+    while chunk := await part.read_chunk(256 * 1024):
+        content += chunk
+        if len(content) > STEP_IMAGE_MAX_BYTES:
+            raise web.HTTPRequestEntityTooLarge(max_size=STEP_IMAGE_MAX_BYTES, actual_size=len(content))
+    name = await asyncio.to_thread(save_step_image, request.app["core"], bytes(content))
+    return web.json_response({"icon": f"image:{name}", "url": f"/pti-step-images/{name}"}, status=201)
+
+
+async def step_image(request: web.Request) -> web.StreamResponse:
+    name = request.match_info["name"]
+    path = step_image_root(request.app["core"]) / name
+    if not STEP_IMAGE_NAME.match(name) or not path.is_file():
+        raise web.HTTPNotFound(text="Image not found")
+    # Names are never reused, so browsers may keep the file for a year.
+    return web.FileResponse(path, headers={"Cache-Control": "public, max-age=31536000, immutable"})
 
 
 def pti_status_payload(core, user_id: int, link: dict) -> dict:
@@ -788,8 +821,8 @@ def pti_status_payload(core, user_id: int, link: dict) -> dict:
             "ORDER BY submitted_at DESC LIMIT 20",
             (user_id, link["account_id"], link["truck_id"]),
         ).fetchall()
-        photos, video = truck_pti_mode(conn, link["account_id"], link["truck_id"])
-        steps = pti_checklist.steps_for_mode(pti_checklist.load_steps(conn), photos, video)
+        # Every truck follows all PTI steps, in the order set in PTI settings.
+        steps = pti_checklist.load_steps(conn)
     interval_hours = int(interval_row[0]) if interval_row else 24
     now = datetime.now(timezone.utc)
     anchor = latest["submitted_at"] if latest else link["linked_at"]
@@ -808,7 +841,7 @@ def pti_status_payload(core, user_id: int, link: dict) -> dict:
         "isInvalidated": bool(latest and latest["invalidated_at"]),
         "invalidationReason": latest["invalidation_reason"] if latest else None,
         **timing,
-        "mode": pti_checklist.mode_name(photos, video),
+        "mode": pti_checklist.mode_name(steps),
         "steps": steps,
         "history": [{
             "id": row["id"], "submittedAt": row["submitted_at"],
@@ -1714,13 +1747,14 @@ def create_app(bot: Bot, core) -> web.Application:
     app.router.add_post("/api/pti/settings", api_pti_settings)
     app.router.add_get("/api/pti/steps", api_pti_steps)
     app.router.add_put("/api/pti/steps", api_pti_steps)
+    app.router.add_post("/api/pti/step-images", api_upload_step_image)
+    app.router.add_get("/pti-step-images/{name}", step_image)
     app.router.add_get("/api/pti/status", api_pti_status)
     app.router.add_get("/api/pti/activity", api_driver_activity)
     app.router.add_post("/api/pti/submit", api_pti_submit)
     app.router.add_post("/api/pti/submissions/{submission_id}/invalidate", api_invalidate_pti)
     app.router.add_get("/api/pti/submissions/{submission_id}", api_pti_submission)
     app.router.add_get("/api/pti/submissions/{submission_id}/photos/{slot}", api_pti_photo)
-    app.router.add_post("/api/trucks/{account_id}/{vehicle_id}/pti/mode", api_truck_pti_mode)
     app.router.add_get("/api/alerts", api_alerts)
     app.router.add_get("/api/alerts/live", api_live_alerts)
     app.router.add_post("/api/trucks/{account_id}/{vehicle_id}/groups", api_add_truck_group)
