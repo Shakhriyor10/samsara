@@ -23,13 +23,18 @@ import pti_checklist
 logger = logging.getLogger("samsara_pti_reports")
 # Telegram bots may upload files up to 50 MB; leave room for ZIP headers.
 ZIP_PART_LIMIT = 48 * 1024 * 1024
-VIDEO_SUFFIXES = {".mp4", ".mov", ".webm"}
+VIDEO_SUFFIXES = {".mp4", ".mov", ".3gp", ".webm"}
 TRANSCODE_TIMEOUT_SECONDS = 600
 VIDEO_LONG_SIDE = 1920
 # Keep 60 fps when the phone really recorded it; otherwise 30 fps.
 HIGH_FPS = 60
 BASE_FPS = 30
 NORMALIZED_SUFFIX = "_cfr.mp4"
+# HDR (HLG/PQ) to standard-range BT.709 so iPhone videos keep normal colors after re-encoding.
+HDR_TO_SDR = (
+    "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,"
+    "tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p"
+)
 REMUXED_STEM = "_indexed"
 # Re-encoded, remuxed, and files from the earlier 30 fps-only version are all already playable.
 NORMALIZED_SUFFIXES = (NORMALIZED_SUFFIX, "_30fps.mp4", f"{REMUXED_STEM}.mp4", f"{REMUXED_STEM}.webm")
@@ -122,18 +127,35 @@ async def _target_fps(source: Path) -> int:
     return HIGH_FPS if fps and fps >= 45 else BASE_FPS
 
 
-async def _encode(source: Path, target: Path, fps: int, rate_args: list[str]) -> bool:
+async def _is_hdr(path: Path) -> bool:
+    """iPhones record HDR (HLG or Dolby Vision/PQ) by default; it looks washed out unless tone-mapped."""
+    process = await asyncio.create_subprocess_exec(
+        "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=color_transfer",
+        "-of", "csv=p=0", str(path),
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+    )
+    stdout, _ = await process.communicate()
+    # Rotated videos add an empty side-data column ("arib-std-b67,"), so match the values, not the whole line.
+    return bool({"arib-std-b67", "smpte2084"} & set(stdout.decode().replace(",", " ").split()))
+
+
+async def _encode(source: Path, target: Path, fps: int, rate_args: list[str], tonemap: bool = False) -> bool:
     """H.264 at up to 1080p and a constant frame rate.
 
     Phone browsers record variable frame rate video (WebM without an index on Android); many
     players show that as stutter, so every frame gets an even 1/fps slot.
     """
     scale = f"scale='if(gt(iw,ih),min({VIDEO_LONG_SIDE},iw),-2)':'if(gt(iw,ih),-2,min({VIDEO_LONG_SIDE},ih))'"
+    filters = f"{scale},fps={fps}"
+    color: list[str] = []
+    if tonemap:
+        filters = f"{HDR_TO_SDR},{filters}"
+        color = ["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"]
     return await _run_ffmpeg(
         # The fps filter plus -r gives a constant rate on every FFmpeg release; -fps_mode needs 5.1+,
         # newer than the ffmpeg package on Ubuntu 22.04.
-        ["-i", str(source), "-vf", f"{scale},fps={fps}", "-r", str(fps),
-         "-c:v", "libx264", "-preset", "veryfast", *rate_args, "-g", str(fps * 2), "-pix_fmt", "yuv420p",
+        ["-i", str(source), "-vf", filters, "-r", str(fps),
+         "-c:v", "libx264", "-preset", "veryfast", *rate_args, "-g", str(fps * 2), "-pix_fmt", "yuv420p", *color,
          "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-movflags", "+faststart", str(target)],
         source.name,
     ) and target.is_file()
@@ -142,7 +164,11 @@ async def _encode(source: Path, target: Path, fps: int, rate_args: list[str]) ->
 async def normalize_video(source: Path, target: Path) -> bool:
     fps = await _target_fps(source)
     maxrate = 9000 if fps == HIGH_FPS else 6000
-    return await _encode(source, target, fps, ["-crf", "21", "-maxrate", f"{maxrate}k", "-bufsize", f"{maxrate * 2}k"])
+    rate_args = ["-crf", "21", "-maxrate", f"{maxrate}k", "-bufsize", f"{maxrate * 2}k"]
+    # Tone mapping needs FFmpeg built with zimg; without it, fall back to a plain encode.
+    if await _is_hdr(source) and await _encode(source, target, fps, rate_args, tonemap=True):
+        return True
+    return await _encode(source, target, fps, rate_args)
 
 
 async def _fit_video(source: Path, target: Path) -> Path:

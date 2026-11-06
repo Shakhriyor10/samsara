@@ -833,10 +833,14 @@ async def api_driver_activity(request: web.Request) -> web.Response:
 
 
 PTI_IMAGE_TYPES = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
-PTI_VIDEO_TYPES = {"video/mp4": ".mp4", "video/quicktime": ".mov", "video/webm": ".webm", "video/x-matroska": ".webm"}
+# Phone camera apps record MP4 or QuickTime (iPhone), sometimes 3GP on older Android.
+PTI_VIDEO_TYPES = {
+    "video/mp4": ".mp4", "video/quicktime": ".mov", "video/3gpp": ".3gp",
+    "video/webm": ".webm", "video/x-matroska": ".webm",
+}
 # Full-resolution camera frames (up to 4096 px wide) at high JPEG quality.
 PTI_MAX_PHOTO_BYTES = 20 * 1024 * 1024
-PTI_MAX_VIDEO_BYTES = 150 * 1024 * 1024
+PTI_MAX_VIDEO_BYTES = 300 * 1024 * 1024
 PTI_MAX_UPLOAD_BYTES = 350 * 1024 * 1024
 
 
@@ -847,8 +851,9 @@ def media_signature_ok(content_type: str, head: bytes) -> bool:
         return head.startswith(b"\x89PNG\r\n\x1a\n")
     if content_type == "image/webp":
         return len(head) >= 12 and head.startswith(b"RIFF") and head[8:12] == b"WEBP"
-    if content_type in {"video/mp4", "video/quicktime"}:
-        return len(head) >= 8 and head[4:8] == b"ftyp"
+    if content_type in {"video/mp4", "video/quicktime", "video/3gpp"}:
+        # ISO/QuickTime files start with a box size and type; older QuickTime may open with moov/wide/mdat.
+        return len(head) >= 8 and head[4:8] in {b"ftyp", b"moov", b"wide", b"mdat", b"free", b"skip"}
     if content_type in {"video/webm", "video/x-matroska"}:
         return head.startswith(b"\x1a\x45\xdf\xa3")
     return False
