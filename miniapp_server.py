@@ -268,6 +268,9 @@ def ensure_pti_schema(core) -> None:
             conn.execute("ALTER TABLE pti_submissions ADD COLUMN mode TEXT")
         if "answers" not in submission_columns:
             conn.execute("ALTER TABLE pti_submissions ADD COLUMN answers TEXT")
+        if "steps" not in submission_columns:
+            conn.execute("ALTER TABLE pti_submissions ADD COLUMN steps TEXT")
+        pti_checklist.ensure_steps_table(conn)
         conn.execute(
             "INSERT OR IGNORE INTO pti_settings(key, value) VALUES('reminder_hours', '2')"
         )
@@ -726,6 +729,26 @@ async def api_pti_settings(request: web.Request) -> web.Response:
     })
 
 
+async def api_pti_steps(request: web.Request) -> web.Response:
+    """The PTI steps every driver follows; admins edit, add, remove and reorder them."""
+    await require_admin(request)
+    core = request.app["core"]
+    if request.method == "PUT":
+        try:
+            payload = await request.json()
+        except (json.JSONDecodeError, web.HTTPBadRequest) as error:
+            raise web.HTTPBadRequest(text="Invalid request body") from error
+        try:
+            with sqlite3.connect(core.STATE_DB) as conn:
+                steps = pti_checklist.save_steps(conn, payload.get("steps") if isinstance(payload, dict) else None)
+        except ValueError as error:
+            raise web.HTTPBadRequest(text=str(error)) from error
+    else:
+        with sqlite3.connect(core.STATE_DB) as conn:
+            steps = pti_checklist.load_steps(conn)
+    return web.json_response({"steps": steps})
+
+
 async def api_truck_pti_mode(request: web.Request) -> web.Response:
     await require_admin(request)
     core = request.app["core"]
@@ -766,6 +789,7 @@ def pti_status_payload(core, user_id: int, link: dict) -> dict:
             (user_id, link["account_id"], link["truck_id"]),
         ).fetchall()
         photos, video = truck_pti_mode(conn, link["account_id"], link["truck_id"])
+        steps = pti_checklist.steps_for_mode(pti_checklist.load_steps(conn), photos, video)
     interval_hours = int(interval_row[0]) if interval_row else 24
     now = datetime.now(timezone.utc)
     anchor = latest["submitted_at"] if latest else link["linked_at"]
@@ -785,7 +809,7 @@ def pti_status_payload(core, user_id: int, link: dict) -> dict:
         "invalidationReason": latest["invalidation_reason"] if latest else None,
         **timing,
         "mode": pti_checklist.mode_name(photos, video),
-        "steps": pti_checklist.steps_for_mode(photos, video),
+        "steps": steps,
         "history": [{
             "id": row["id"], "submittedAt": row["submitted_at"],
             "invalidatedAt": row["invalidated_at"], "invalidationReason": row["invalidation_reason"],
@@ -950,10 +974,10 @@ async def api_pti_submit(request: web.Request) -> web.Response:
         submitted_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
         with sqlite3.connect(core.STATE_DB) as conn:
             conn.execute(
-                "INSERT INTO pti_submissions(id,telegram_user_id,account_id,truck_id,submitted_at,mode,answers) "
-                "VALUES(?,?,?,?,?,?,?)",
+                "INSERT INTO pti_submissions(id,telegram_user_id,account_id,truck_id,submitted_at,mode,answers,steps) "
+                "VALUES(?,?,?,?,?,?,?,?)",
                 (submission_id, int(user["id"]), link["account_id"], link["truck_id"], submitted_at,
-                 schedule["mode"], json.dumps(kept_answers)),
+                 schedule["mode"], json.dumps(kept_answers), json.dumps(pti_checklist.snapshot(steps))),
             )
             conn.executemany(
                 "INSERT INTO pti_photos(submission_id,slot,file_path) VALUES(?,?,?)",
@@ -1087,17 +1111,20 @@ async def api_pti_submission(request: web.Request) -> web.Response:
     submission_id = request.match_info["submission_id"]
     with sqlite3.connect(core.STATE_DB) as conn:
         row = conn.execute(
-            "SELECT telegram_user_id,account_id,truck_id,submitted_at,mode,answers FROM pti_submissions WHERE id=?",
+            "SELECT telegram_user_id,account_id,truck_id,submitted_at,mode,answers,steps FROM pti_submissions WHERE id=?",
             (submission_id,),
         ).fetchone()
         slots = {slot for (slot,) in conn.execute("SELECT slot FROM pti_photos WHERE submission_id=?", (submission_id,))}
+        current_steps = pti_checklist.load_steps(conn)
     if row is None:
         raise web.HTTPNotFound(text="PTI submission not found")
     if role != "admin" and (int(row[0]) != int(user["id"]) or row[1] != link["account_id"] or row[2] != link["truck_id"]):
         raise web.HTTPForbidden(text="You cannot view another driver's PTI")
     return web.json_response({
         "id": submission_id, "submittedAt": row[3], "mode": row[4] or "photo",
-        "items": pti_reports.submission_items(slots, json.loads(row[5] or "{}")),
+        "items": pti_reports.submission_items(
+            slots, json.loads(row[5] or "{}"), json.loads(row[6] or "null"), current_steps,
+        ),
     })
 
 
@@ -1685,6 +1712,8 @@ def create_app(bot: Bot, core) -> web.Application:
     app.router.add_post("/api/trucks/{account_id}/{vehicle_id}/pti/notify", api_notify_truck_driver)
     app.router.add_get("/api/pti/settings", api_pti_settings)
     app.router.add_post("/api/pti/settings", api_pti_settings)
+    app.router.add_get("/api/pti/steps", api_pti_steps)
+    app.router.add_put("/api/pti/steps", api_pti_steps)
     app.router.add_get("/api/pti/status", api_pti_status)
     app.router.add_get("/api/pti/activity", api_driver_activity)
     app.router.add_post("/api/pti/submit", api_pti_submit)

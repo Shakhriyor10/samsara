@@ -43,25 +43,35 @@ VIDEO_SIZE_LIMIT = ZIP_PART_LIMIT - 2 * 1024 * 1024
 _BUILD_LOCK: asyncio.Lock | None = None
 
 
-def submission_items(slots: set[str], answers: dict) -> list[dict]:
-    """Captured steps of one PTI in checklist order, plus any older six-view photos."""
+def submission_items(
+    slots: set[str], answers: dict, snapshot: list[dict] | None = None, current: list[dict] | None = None,
+) -> list[dict]:
+    """Captured steps of one PTI in the order the driver took them.
+
+    Labels come from the steps saved with the submission, so later edits in the step editor do not
+    rename older archives; submissions from before snapshots fall back to today's steps.
+    """
+    known_steps = {step["key"]: step for step in (current or [])}
+    ordered = snapshot or list(current or [])
     items: list[dict] = []
-    known = set()
-    for step in [*pti_checklist.CHECKLIST_STEPS, pti_checklist.WALKAROUND_STEP]:
+    seen: set[str] = set()
+    for step in ordered:
         key = step["key"]
-        known.add(key)
+        seen.add(key)
         answer = answers.get(key) or {}
         if key not in slots and not answer:
             continue
+        kind = step.get("kind") or known_steps.get(key, {}).get("kind") or "photo"
+        kind = "video" if kind != "photo" and kind != "check" else kind
         items.append({
-            "key": key, "title": step["title"], "kind": step["kind"],
-            "section": step["section"], "sectionTitle": step["sectionTitle"],
+            "key": key, "title": step.get("title") or pti_checklist.step_label(key), "kind": kind,
+            "section": f"{kind}s", "sectionTitle": pti_checklist.SECTION_TITLES.get(kind, "Checks"),
             "hasMedia": key in slots, "answer": answer,
         })
-    for key in sorted(slots - known):
+    for key in sorted(slots - seen):
         items.append({
             "key": key, "title": pti_checklist.step_label(key), "kind": "photo",
-            "section": "legacy", "sectionTitle": "Photos", "hasMedia": True, "answer": {},
+            "section": "photos", "sectionTitle": "Photos", "hasMedia": True, "answer": {},
         })
     return items
 
@@ -239,12 +249,9 @@ def _report_text(meta: dict, items: list[dict]) -> str:
         f"Submitted: {meta['submitted']}",
         f"Includes: {meta['mode_label']}",
         "",
+        "STEPS (in the order the driver took them)",
     ]
-    section = None
-    for item in items:
-        if item["sectionTitle"] != section:
-            section = item["sectionTitle"]
-            lines += ["", section.upper()]
+    for number, item in enumerate(items, start=1):
         answer = item["answer"]
         if answer.get("na"):
             result = "Not applicable"
@@ -256,7 +263,7 @@ def _report_text(meta: dict, items: list[dict]) -> str:
             result = "Video"
         if item["hasMedia"] and item.get("file"):
             result += f" ({item['file']})"
-        lines.append(f"- {item['title']}: {result}")
+        lines.append(f"{number}. {item['title']}: {result}")
     return "\n".join(lines) + "\n"
 
 
@@ -288,7 +295,7 @@ def _load_submission(core, submission_id: str) -> tuple[dict, list[dict], list[t
     with sqlite3.connect(core.STATE_DB) as conn:
         row = conn.execute(
             "SELECT s.telegram_user_id,s.account_id,s.truck_id,s.submitted_at,s.mode,s.answers,"
-            "COALESCE(d.truck_name,s.truck_id),COALESCE(d.telegram_name,'') "
+            "COALESCE(d.truck_name,s.truck_id),COALESCE(d.telegram_name,''),s.steps "
             "FROM pti_submissions s LEFT JOIN driver_accounts d ON d.account_id=s.account_id AND d.truck_id=s.truck_id "
             "WHERE s.id=?", (submission_id,),
         ).fetchone()
@@ -296,6 +303,7 @@ def _load_submission(core, submission_id: str) -> tuple[dict, list[dict], list[t
             return None
         media = conn.execute("SELECT slot,file_path FROM pti_photos WHERE submission_id=?", (submission_id,)).fetchall()
         chat_row = conn.execute("SELECT value FROM pti_settings WHERE key='report_chat_id'").fetchone()
+        current_steps = pti_checklist.load_steps(conn)
     chat_value = (chat_row[0] if chat_row else "") or ""
     chat_id = int(chat_value) if chat_value.lstrip("-").isdigit() else None
     submitted = datetime.fromisoformat(row[3].replace("Z", "+00:00"))
@@ -307,9 +315,11 @@ def _load_submission(core, submission_id: str) -> tuple[dict, list[dict], list[t
         "truck": row[6], "company": core.account_label(row[1]), "driver": row[7] or "Driver",
         "driver_id": row[0], "submitted": local.strftime("%b %d, %Y %I:%M %p %Z"),
         "stamp": local.strftime("%Y-%m-%d_%H%M"), "mode": mode,
-        "mode_label": {"photo": "Photos", "video": "Walk-around video", "both": "Photos + walk-around video"}[mode],
+        "mode_label": {"photo": "Photos", "video": "Videos", "both": "Photos + videos"}[mode],
     }
-    items = submission_items({slot for slot, _ in media}, json.loads(row[5] or "{}"))
+    items = submission_items(
+        {slot for slot, _ in media}, json.loads(row[5] or "{}"), json.loads(row[8] or "null"), current_steps,
+    )
     return meta, items, media, chat_id
 
 
