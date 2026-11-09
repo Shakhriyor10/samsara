@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import html
+import json
 import logging
 import os
 import shutil
 import sqlite3
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -22,7 +24,10 @@ import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError, TelegramRetryAfter, TelegramServerError
+from aiogram.exceptions import (
+    TelegramBadRequest, TelegramForbiddenError, TelegramMigrateToChat, TelegramNetworkError, TelegramRetryAfter,
+    TelegramServerError,
+)
 from aiogram.filters import Command
 from aiogram.types import BotCommand, BufferedInputFile, CallbackQuery, ChatMemberUpdated, InlineKeyboardButton, InlineKeyboardMarkup, Message, WebAppInfo
 from dotenv import load_dotenv
@@ -125,6 +130,7 @@ def init_state() -> None:
         # and makes each small commit cheaper. The setting persists in the file.
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("CREATE TABLE IF NOT EXISTS sent_events (event_id TEXT PRIMARY KEY, sent_at TEXT NOT NULL)")
+        ensure_alert_outbox(conn)
         conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         conn.execute("CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY, added_at TEXT NOT NULL)")
         conn.execute(
@@ -1125,7 +1131,7 @@ async def _run_ffmpeg_encode(
         command.extend(["-map", "0:v:0", "-vf", ",".join(filters)])
     command.extend([
         "-an", "-sn", "-dn",
-        "-c:v", "libx264", "-preset", "slow", "-crf", str(crf),
+        "-c:v", "libx264", "-preset", "medium", "-crf", str(crf),
         "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-f", "mp4", str(output_path),
     ])
     process = await asyncio.create_subprocess_exec(
@@ -1141,6 +1147,47 @@ async def _run_ffmpeg_encode(
         return -1, "FFmpeg timed out while converting the camera video"
     lines = (stderr or b"").decode("utf-8", errors="replace").splitlines()
     return process.returncode, "\n".join(lines[-30:])
+
+
+def _render_overlay_frames(
+    overlay_path: Path, overlay: dict[str, Any], target_width: int, target_height: int, video_duration: float
+) -> None:
+    """Draw the speed overlay frames (5 per second) for one output size."""
+    overlay_path.mkdir(parents=True, exist_ok=True)
+    samples = [
+        point for point in overlay.get("speed_points", [])
+        if isinstance(point, dict) and point.get("time") is not None and isinstance(point.get("mph"), (int, float))
+    ]
+    event_epoch = float(overlay.get("event_epoch") or 0)
+    frames_per_second = 5
+    frame_count = max(1, min(600, int(video_duration * frames_per_second + 0.999)))
+    timed = sorted(samples, key=lambda point: point["time"].timestamp())
+    for frame_index in range(frame_count):
+        # Safety-event clips are requested around the event timestamp.
+        video_second = frame_index / frames_per_second
+        sample_epoch = event_epoch + video_second - video_duration / 2
+        current_speed = None
+        if timed:
+            before = [point for point in timed if point["time"].timestamp() <= sample_epoch]
+            after = [point for point in timed if point["time"].timestamp() >= sample_epoch]
+            left = before[-1] if before else None
+            right = after[0] if after else None
+            if left and right:
+                left_time, right_time = left["time"].timestamp(), right["time"].timestamp()
+                if sample_epoch - left_time <= 15 and right_time - sample_epoch <= 15:
+                    if right_time <= left_time:
+                        current_speed = float(left["mph"])
+                    else:
+                        ratio = (sample_epoch - left_time) / (right_time - left_time)
+                        current_speed = float(left["mph"]) + (float(right["mph"]) - float(left["mph"])) * ratio
+            else:
+                nearest = min(timed, key=lambda point: abs(point["time"].timestamp() - sample_epoch))
+                if abs(nearest["time"].timestamp() - sample_epoch) <= 3:
+                    current_speed = float(nearest["mph"])
+        _render_telematics_overlay(
+            overlay_path / f"frame-{frame_index:04d}.png", overlay, target_width, target_height,
+            current_speed, sample_epoch,
+        )
 
 
 async def convert_video_for_telegram(
@@ -1196,41 +1243,10 @@ async def convert_video_for_telegram(
         overlay_path = source_path.with_name(f"telematics-overlay-{target_width}x{target_height}")
         try:
             if not overlay_path.is_dir() or not any(overlay_path.glob("frame-*.png")):
-                overlay_path.mkdir(parents=True, exist_ok=True)
-                samples = [
-                    point for point in overlay.get("speed_points", [])
-                    if isinstance(point, dict) and point.get("time") is not None and isinstance(point.get("mph"), (int, float))
-                ]
-                event_epoch = float(overlay.get("event_epoch") or 0)
-                frames_per_second = 5
-                frame_count = max(1, min(600, int(video_duration * frames_per_second + 0.999)))
-                timed = sorted(samples, key=lambda point: point["time"].timestamp())
-                for frame_index in range(frame_count):
-                    # Safety-event clips are requested around the event timestamp.
-                    video_second = frame_index / frames_per_second
-                    sample_epoch = event_epoch + video_second - video_duration / 2
-                    current_speed = None
-                    if timed:
-                        before = [point for point in timed if point["time"].timestamp() <= sample_epoch]
-                        after = [point for point in timed if point["time"].timestamp() >= sample_epoch]
-                        left = before[-1] if before else None
-                        right = after[0] if after else None
-                        if left and right:
-                            left_time, right_time = left["time"].timestamp(), right["time"].timestamp()
-                            if sample_epoch - left_time <= 15 and right_time - sample_epoch <= 15:
-                                if right_time <= left_time:
-                                    current_speed = float(left["mph"])
-                                else:
-                                    ratio = (sample_epoch - left_time) / (right_time - left_time)
-                                    current_speed = float(left["mph"]) + (float(right["mph"]) - float(left["mph"])) * ratio
-                        else:
-                            nearest = min(timed, key=lambda point: abs(point["time"].timestamp() - sample_epoch))
-                            if abs(nearest["time"].timestamp() - sample_epoch) <= 3:
-                                current_speed = float(nearest["mph"])
-                    _render_telematics_overlay(
-                        overlay_path / f"frame-{frame_index:04d}.png", overlay, target_width, target_height,
-                        current_speed, sample_epoch,
-                    )
+                # Drawing up to 600 PNG frames takes seconds of CPU; a thread keeps the bot and Mini App responsive.
+                await asyncio.to_thread(
+                    _render_overlay_frames, overlay_path, overlay, target_width, target_height, video_duration
+                )
         except Exception as error:
             last_diagnostic = f"Could not render telemetry overlay image: {error}"
             logger.warning("Could not render telemetry overlay image: %s", error, exc_info=True)
@@ -1248,7 +1264,7 @@ async def convert_video_for_telegram(
         if return_code == 0 and output_path.is_file():
             output_size = output_path.stat().st_size
             if output_size <= MAX_TELEGRAM_VIDEO_BYTES:
-                logger.info("Prepared video with Samsara-style data overlay (max %sx%s, CRF %s, preset slow, %s bytes)", width, height, crf, output_size)
+                logger.info("Prepared video with Samsara-style data overlay (max %sx%s, CRF %s, preset medium, %s bytes)", width, height, crf, output_size)
                 return BufferedInputFile(output_path.read_bytes(), filename="samsara-safety-event.mp4"), True
             logger.info("Compressed video is still too large at CRF %s (%s bytes); lowering size/quality", crf, output_size)
 
@@ -1515,39 +1531,272 @@ async def send_event_media(
     return await send_video_with_fallback(bot, chat_id, video_url, caption, enriched_event, account)
 
 
-async def notify_event(bot: Bot, event: dict[str, Any], account: SamsaraAccount) -> None:
-    identifier = event_id(event)
-    if not identifier:
-        logger.warning("Skipping event without an ID: %s", event)
-        return
-    asset = event.get("asset") or event.get("vehicle") or {}
-    vehicle_id = event.get("vehicleId") or event.get("assetId")
-    if not vehicle_id and isinstance(asset, dict):
-        vehicle_id = asset.get("id")
-    if not vehicle_id:
-        logger.warning("Skipping event without a vehicle ID: %s", identifier)
-        return
+# ---- Safety alert delivery queue ----
+# Polling only records which alerts are owed (alert_outbox); a separate dispatcher delivers them and keeps
+# retrying until Telegram accepts each one. A slow video, a Telegram outage or one broken group therefore
+# never blocks newer alerts or other groups, and nothing is lost when the bot restarts.
+ALERT_POLL_OVERLAP = timedelta(minutes=15)  # Samsara can index an event a few minutes after its update time.
+ALERT_VIDEO_BUDGET_SECONDS = 360
+ALERT_VIDEO_ATTEMPTS = 3  # Fresh events often get their clip a few minutes later; then the text goes out alone.
+ALERT_VIDEO_RETRY_DELAY = timedelta(minutes=3)
+ALERT_GIVE_UP_AFTER = timedelta(hours=24)
+ALERT_BACKOFF_SECONDS = (30, 60, 120, 300, 600, 900)
+ALERT_WAKE = asyncio.Event()
+ALERT_VIDEO_SLOTS = asyncio.Semaphore(1)  # Video encoding is CPU-heavy; one at a time keeps the bot responsive.
+
+
+def ensure_alert_outbox(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS alert_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "account_id TEXT NOT NULL, chat_id INTEGER NOT NULL, event_id TEXT NOT NULL, event_json TEXT NOT NULL, "
+        "status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, "
+        "video_attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL, created_at TEXT NOT NULL, "
+        "sent_at TEXT, last_error TEXT, UNIQUE(account_id, chat_id, event_id))"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_alert_outbox_due ON alert_outbox(status, next_attempt_at)")
+
+
+def enqueue_event_alerts(event: dict[str, Any], account: SamsaraAccount) -> int:
+    """Record one pending alert per group that follows the event's truck; returns how many are new."""
+    identifier, vehicle_id = event_id(event), _vehicle_id(event)
+    if not identifier or not vehicle_id:
+        logger.warning("Skipping safety event without an ID or vehicle: %s", identifier or event)
+        return 0
+    now, payload, added = utc_iso(datetime.now(timezone.utc)), json.dumps(event), 0
     with sqlite3.connect(STATE_DB) as conn:
-        rows = conn.execute(
+        chats = [row[0] for row in conn.execute(
             "SELECT DISTINCT chat_id FROM group_trucks WHERE account_id = ? AND truck_id = ?",
-            (account.account_id, str(vehicle_id)),
+            (account.account_id, vehicle_id),
+        )]
+        for chat_id in chats:
+            if conn.execute(
+                "SELECT 1 FROM sent_events WHERE event_id = ?", (f"{account.account_id}:{chat_id}:{identifier}",)
+            ).fetchone():
+                continue
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO alert_outbox(account_id, chat_id, event_id, event_json, next_attempt_at, created_at) "
+                "VALUES(?, ?, ?, ?, ?, ?)",
+                (account.account_id, chat_id, identifier, payload, now, now),
+            )
+            if cursor.rowcount:
+                added += 1
+            else:
+                # Samsara updates events (driver, media); keep the newest copy while the alert is still owed.
+                conn.execute(
+                    "UPDATE alert_outbox SET event_json = ? WHERE account_id = ? AND chat_id = ? AND event_id = ? "
+                    "AND status = 'pending'",
+                    (payload, account.account_id, chat_id, identifier),
+                )
+    return added
+
+
+def _parse_utc(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def due_alerts(busy: set[tuple[str, str]]) -> dict[tuple[str, str], list[dict[str, Any]]]:
+    with sqlite3.connect(STATE_DB) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM alert_outbox WHERE status = 'pending' AND next_attempt_at <= ? ORDER BY created_at LIMIT 100",
+            (utc_iso(datetime.now(timezone.utc)),),
         ).fetchall()
-    for (chat_id,) in rows:
-        scoped_identifier = f"{account.account_id}:{chat_id}:{identifier}"
-        if was_sent(scoped_identifier):
-            continue
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in rows:
+        key = (row["account_id"], row["event_id"])
+        if key not in busy:
+            grouped.setdefault(key, []).append(dict(row))
+    return grouped
+
+
+def update_alert(row_id: int, **fields: Any) -> None:
+    assignments = ", ".join(f"{name} = ?" for name in fields)
+    with sqlite3.connect(STATE_DB) as conn:
+        conn.execute(f"UPDATE alert_outbox SET {assignments} WHERE id = ?", (*fields.values(), row_id))
+
+
+def move_group_chat(old_chat_id: int, new_chat_id: int) -> None:
+    """A group upgraded to a supergroup gets a new ID; carry its trucks and owed alerts over."""
+    with sqlite3.connect(STATE_DB) as conn:
+        conn.execute("UPDATE OR IGNORE group_trucks SET chat_id = ? WHERE chat_id = ?", (new_chat_id, old_chat_id))
+        conn.execute("DELETE FROM group_trucks WHERE chat_id = ?", (old_chat_id,))
+        conn.execute(
+            "UPDATE OR IGNORE alert_outbox SET chat_id = ? WHERE chat_id = ? AND status = 'pending'",
+            (new_chat_id, old_chat_id),
+        )
+    remember_bot_group(old_chat_id, None, "group", False)
+    logger.warning("Telegram group %s became supergroup %s; moved its trucks and pending alerts", old_chat_id, new_chat_id)
+
+
+async def alert_video(event: dict[str, Any], enriched: dict[str, Any], account: SamsaraAccount) -> bytes | None:
+    """The event clip ready for Telegram, shared with the Mini App's video cache; None if unavailable."""
+    import miniapp_server
+
+    core = sys.modules[__name__]
+    stamp, vehicle_id, identifier = event_timestamp(event), _vehicle_id(event), event_id(event)
+    cache_key = None
+    if stamp and vehicle_id and identifier:
+        event_date = stamp.astimezone(ZoneInfo(EVENT_TIMEZONE)).date().isoformat()
+        cache_key = miniapp_server.event_video_cache_key(account.account_id, vehicle_id, identifier, event_date)
+        cached = await asyncio.to_thread(miniapp_server.find_cached_event_video, core, cache_key)
+        if cached:
+            return await asyncio.to_thread(cached.read_bytes)
+    try:
+        async with ALERT_VIDEO_SLOTS:
+            video = await asyncio.wait_for(
+                miniapp_server.prepare_event_video(core, event, account, enriched=enriched),
+                ALERT_VIDEO_BUDGET_SECONDS,
+            )
+    except asyncio.TimeoutError:
+        logger.warning("Video for safety event %s was not ready within %s seconds", identifier, ALERT_VIDEO_BUDGET_SECONDS)
+        return None
+    except Exception:
+        logger.info("Video is not available yet for safety event %s", identifier, exc_info=True)
+        return None
+    if cache_key and stamp:
         try:
-            await send_event_media(bot, chat_id, event, account)
-            mark_sent(scoped_identifier)
-            logger.info("Sent safety event %s for account %s to chat %s", identifier, account.account_id, chat_id)
+            await miniapp_server.store_event_video_cache(core, cache_key, stamp, video)
+        except Exception:
+            logger.warning("Could not cache the video for safety event %s", identifier, exc_info=True)
+    return video
+
+
+async def notify_admins_of_failed_alert(bot: Bot, row: dict[str, Any], error: str) -> None:
+    with sqlite3.connect(STATE_DB) as conn:
+        admins = [row_[0] for row_ in conn.execute("SELECT user_id FROM admins")]
+        truck = conn.execute(
+            "SELECT truck_name FROM group_trucks WHERE chat_id = ? LIMIT 1", (row["chat_id"],)
+        ).fetchone()
+    text = (
+        f"⚠️ A safety alert could not be delivered to Telegram group <code>{row['chat_id']}</code>"
+        f"{f' ({html.escape(truck[0])})' if truck else ''} for 24 hours.\n"
+        f"Reason: {html.escape(error[:300])}\n"
+        "Check that the bot is still a member of the group and is allowed to post messages and videos."
+    )
+    for admin_id in admins:
+        try:
+            await bot.send_message(admin_id, text)
+        except Exception:
+            logger.info("Could not tell admin %s about an undelivered alert", admin_id, exc_info=True)
+
+
+async def record_alert_failure(bot: Bot, row: dict[str, Any], error: Exception) -> None:
+    attempts = int(row["attempts"]) + 1
+    message = f"{type(error).__name__}: {error}"
+    if datetime.now(timezone.utc) - _parse_utc(row["created_at"]) > ALERT_GIVE_UP_AFTER:
+        update_alert(row["id"], status="failed", attempts=attempts, last_error=message[:500])
+        logger.error("Gave up on safety alert %s for chat %s after %s attempts: %s", row["event_id"], row["chat_id"], attempts, message)
+        await notify_admins_of_failed_alert(bot, row, message)
+        return
+    delay = ALERT_BACKOFF_SECONDS[min(attempts - 1, len(ALERT_BACKOFF_SECONDS) - 1)]
+    if isinstance(error, TelegramRetryAfter):
+        delay = max(delay, int(error.retry_after) + 1)
+    update_alert(
+        row["id"], attempts=attempts, last_error=message[:500],
+        next_attempt_at=utc_iso(datetime.now(timezone.utc) + timedelta(seconds=delay)),
+    )
+    logger.warning("Safety alert %s for chat %s failed (attempt %s); retrying in %s s: %s",
+                   row["event_id"], row["chat_id"], attempts, delay, message)
+
+
+async def deliver_alert(bot: Bot, row: dict[str, Any], caption: str, video: bytes | None) -> None:
+    chat_id = int(row["chat_id"])
+    for _ in range(3):
+        try:
+            sent_video = False
+            if video:
+                try:
+                    await telegram_call_with_retry(
+                        bot.send_video, chat_id=chat_id, caption=caption, supports_streaming=True,
+                        video=BufferedInputFile(video, filename="samsara-safety-event.mp4"),
+                    )
+                    sent_video = True
+                except TelegramBadRequest:
+                    # For example the group forbids videos: the alert itself still has to arrive.
+                    logger.warning("Telegram rejected the video for chat %s; sending the alert as text", chat_id, exc_info=True)
+            if not sent_video:
+                await telegram_call_with_retry(
+                    bot.send_message, chat_id=chat_id, text=caption + "\n📹 Video is unavailable in Telegram."
+                )
+            update_alert(row["id"], status="sent", sent_at=utc_iso(datetime.now(timezone.utc)), last_error=None)
+            mark_sent(f"{row['account_id']}:{chat_id}:{row['event_id']}")
+            logger.info("Sent safety event %s to chat %s%s", row["event_id"], chat_id, "" if sent_video else " (text only)")
+            return
+        except TelegramMigrateToChat as error:
+            move_group_chat(chat_id, error.migrate_to_chat_id)
+            chat_id = error.migrate_to_chat_id
         except Exception as error:
-            logger.exception("Could not send safety event %s to chat %s", identifier, chat_id)
-            # Transient Telegram failures and unexpected bugs stop checkpoint
-            # advancement; permanent chat errors are isolated to this group.
-            if isinstance(error, (TelegramRetryAfter, TelegramNetworkError, TelegramServerError)):
-                raise
-            if not isinstance(error, (TelegramBadRequest, TelegramForbiddenError)):
-                raise
+            await record_alert_failure(bot, row, error)
+            return
+    await record_alert_failure(bot, row, RuntimeError("The group kept changing its Telegram ID"))
+
+
+async def process_event_alerts(bot: Bot, rows: list[dict[str, Any]]) -> None:
+    account = next((item for item in ACCOUNTS if item.account_id == rows[0]["account_id"]), None)
+    if account is None:
+        for row in rows:
+            update_alert(row["id"], status="failed", last_error="Samsara account is no longer configured")
+        return
+    event = json.loads(rows[-1]["event_json"])
+    try:
+        enriched = await enrich_event_for_video(event, account)
+    except Exception:
+        logger.warning("Could not add driver and speed details to safety event %s", rows[0]["event_id"], exc_info=True)
+        enriched = event
+    video = await alert_video(event, enriched, account)
+    oldest = min(_parse_utc(row["created_at"]) for row in rows)
+    video_attempts = max(int(row["video_attempts"]) for row in rows) + 1
+    if video is None and video_attempts < ALERT_VIDEO_ATTEMPTS and datetime.now(timezone.utc) - oldest < timedelta(minutes=20):
+        retry_at = utc_iso(datetime.now(timezone.utc) + ALERT_VIDEO_RETRY_DELAY)
+        for row in rows:
+            update_alert(row["id"], video_attempts=video_attempts, next_attempt_at=retry_at, last_error="Waiting for the camera video")
+        logger.info("Video for safety event %s is not ready; trying again in %s", rows[0]["event_id"], ALERT_VIDEO_RETRY_DELAY)
+        return
+    caption = event_caption(enriched)
+    await asyncio.gather(*(deliver_alert(bot, row, caption, video) for row in rows))
+
+
+def prune_alert_outbox() -> None:
+    cutoff = utc_iso(datetime.now(timezone.utc) - timedelta(days=14))
+    with sqlite3.connect(STATE_DB) as conn:
+        conn.execute("DELETE FROM alert_outbox WHERE status != 'pending' AND created_at < ?", (cutoff,))
+
+
+async def alert_dispatcher(bot: Bot) -> None:
+    """Deliver owed alerts: up to two events at a time, each to all of its groups at once."""
+    busy: set[tuple[str, str]] = set()
+    slots = asyncio.Semaphore(2)
+    last_prune = 0.0
+
+    async def run(key: tuple[str, str], rows: list[dict[str, Any]]) -> None:
+        try:
+            async with slots:
+                await process_event_alerts(bot, rows)
+        except Exception:
+            logger.exception("Safety alert delivery failed unexpectedly for event %s", key[1])
+            for row in rows:
+                await record_alert_failure(bot, row, RuntimeError("Unexpected delivery error"))
+        finally:
+            busy.discard(key)
+            ALERT_WAKE.set()
+
+    while True:
+        try:
+            for key, rows in (await asyncio.to_thread(due_alerts, set(busy))).items():
+                busy.add(key)
+                asyncio.create_task(run(key, rows))
+            if time.monotonic() - last_prune > 3600:
+                last_prune = time.monotonic()
+                await asyncio.to_thread(prune_alert_outbox)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Could not read the safety alert queue; will retry")
+        try:
+            await asyncio.wait_for(ALERT_WAKE.wait(), timeout=10)
+        except asyncio.TimeoutError:
+            pass
+        ALERT_WAKE.clear()
 
 
 async def admin_command(message: Message) -> None:
@@ -1942,17 +2191,25 @@ async def history_callback(callback: CallbackQuery, bot: Bot) -> None:
 
 
 async def samsara_worker(bot: Bot, account: SamsaraAccount) -> None:
+    """Find new safety events and queue their alerts; alert_dispatcher does the sending."""
     timeout = aiohttp.ClientTimeout(total=45)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         while True:
             cycle_end = datetime.now(timezone.utc)
-            cycle_start = get_checkpoint(account)
+            # Overlap the previous window: events can appear in the API minutes after their update time.
+            # Alerts already queued or sent are skipped, so the overlap never sends twice.
+            cycle_start = get_checkpoint(account) - ALERT_POLL_OVERLAP
             try:
                 events = await get_events(session, account, cycle_start, cycle_end)
+                queued = 0
                 for event in events:
-                    await notify_event(bot, event, account)
+                    queued += await asyncio.to_thread(enqueue_event_alerts, event, account)
                 save_checkpoint(account, cycle_end)
-                logger.info("Account %s: checked %s safety event(s)", account.account_id, len(events))
+                if queued:
+                    ALERT_WAKE.set()
+                    logger.info("Account %s: queued %s safety alert(s)", account.account_id, queued)
+                else:
+                    logger.debug("Account %s: checked %s safety event(s)", account.account_id, len(events))
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -2083,6 +2340,7 @@ async def main() -> None:
             BotCommand(command="history", description="Recent events for a selected truck"),
         ])
         workers = [samsara_worker(bot, account) for account in ACCOUNTS]
+        workers.append(alert_dispatcher(bot))
         workers.append(pti_reminder_worker(bot))
         await asyncio.gather(dispatcher.start_polling(bot), *workers)
     finally:

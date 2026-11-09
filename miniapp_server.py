@@ -1620,9 +1620,10 @@ async def api_send_event(request: web.Request) -> web.Response:
     return web.json_response({"queued": True})
 
 
-async def prepare_event_video(core, event: dict, account) -> bytes:
+async def prepare_event_video(core, event: dict, account, enriched: dict | None = None) -> bytes:
     """Prepare the same Samsara clip and visual treatment used for Telegram delivery."""
-    enriched = await core.enrich_event_for_video(event, account)
+    # Callers that already looked up driver and speed details pass them in to skip a second round of API calls.
+    enriched = enriched or await core.enrich_event_for_video(event, account)
     overlay = enriched.get("_videoOverlay", {})
     event_url = core.find_video_url(enriched)
 

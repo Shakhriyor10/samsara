@@ -32,6 +32,8 @@ All event, history, and video timestamps use New York time (`America/New_York`),
 ## Behavior
 
 - Samsara polling runs every 30 seconds (`POLL_INTERVAL_SECONDS`).
+- Each poll re-reads the last 15 minutes, because Samsara can index an event a few minutes after its update time, and only queues alerts in the `alert_outbox` table. A separate dispatcher delivers them: two events at a time, each to all of its groups at once, with the video prepared once per event and shared with the Mini App cache. Failed sends are retried with backoff (30 s up to 15 min) until Telegram accepts them; if a clip is not ready yet the bot waits up to two times for 3 minutes, then sends the alert as text; if a group forbids videos the alert goes out as text; a group upgraded to a supergroup is moved to its new ID automatically. After 24 hours of failures (for example the bot was removed from the group) the alert is marked failed and the bot administrators get a private message.
+- Telemetry overlay frames are drawn in a worker thread and FFmpeg uses the `medium` preset, so video preparation no longer freezes the bot or the Mini App.
 - On the first run, the bot checks the previous 10 minutes (`INITIAL_LOOKBACK_MINUTES`).
 - SQLite database `samsara_bot.sqlite3` stores polling checkpoints and sent-event IDs to prevent duplicates after a restart.
 - Automatic alerts and `/history` preserve the source resolution up to 1920×1080, remove audio, and add available driver, truck, location, and speed details. Historical speed samples are rendered as a graph. Videos are compressed only as much as needed to fit Telegram's 49,000,000-byte upload limit and are sent as silent MP4 videos.
