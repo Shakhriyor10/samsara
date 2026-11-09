@@ -25,6 +25,18 @@ sudo bash /var/www/samsara/deploy/configure-ubuntu.sh
 
 The script checks that DNS already resolves to the target IP, installs Python, FFmpeg, and Nginx, prepares the systemd service, updates `WEBAPP_URL` to `https://baw-sam.uz/`, and runs Certbot. It refuses to replace another active Nginx site for this domain or reuse a site pointing to a different upstream. Certbot prompts for a contact email and Terms of Service acceptance. The script intentionally does not change the provider firewall rules.
 
+## Resource priority
+
+The VPS also runs other projects. `samsara-bot-priority.conf` reserves memory for this bot and gives it priority for CPU and disk when the server is busy (it limits nothing while resources are free). Install it as a systemd drop-in, which leaves the service file itself unchanged:
+
+```bash
+sudo install -D -m 0644 /var/www/samsara/deploy/samsara-bot-priority.conf /etc/systemd/system/samsara-bot.service.d/priority.conf
+sudo systemctl daemon-reload && sudo systemctl restart samsara-bot
+systemctl show samsara-bot -p MemoryMin -p MemoryLow -p CPUWeight -p IOWeight -p OOMScoreAdjust
+```
+
+To undo it, remove `/etc/systemd/system/samsara-bot.service.d/priority.conf`, then run `daemon-reload` and restart the service. The settings need cgroup v2 (`stat -fc %T /sys/fs/cgroup` prints `cgroup2fs`), the default on Ubuntu 22.04 and later.
+
 After successful startup, open `/app` in the bot and check PTI camera access through the HTTPS domain. Useful commands:
 
 ```bash
