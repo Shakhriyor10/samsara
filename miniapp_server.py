@@ -89,6 +89,14 @@ def event_video_cache_key(account_id: str, vehicle_id: str, event_id: str, event
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def _discard_cached_video(path: Path) -> None:
+    # A file the bot cannot delete (for example one left by a run as root) is skipped, not fatal.
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        logger.warning("Could not remove cached event video %s; check its owner and permissions", path, exc_info=True)
+
+
 def find_cached_event_video(core, cache_key: str) -> Path | None:
     root = event_video_cache_root(core)
     now_epoch = datetime.now(timezone.utc).timestamp()
@@ -97,10 +105,10 @@ def find_cached_event_video(core, cache_key: str) -> Path | None:
         try:
             event_epoch = int(path.name.split("_", 1)[0])
         except (ValueError, IndexError):
-            path.unlink(missing_ok=True)
+            _discard_cached_video(path)
             continue
         if event_epoch < cutoff_epoch or event_epoch > now_epoch + 300:
-            path.unlink(missing_ok=True)
+            _discard_cached_video(path)
             continue
         return path
     return None
@@ -185,6 +193,14 @@ async def prewarm_event_video(app: web.Application, account, event: dict) -> Non
 
 
 def schedule_event_video_prewarm(app: web.Application, account, event: dict) -> None:
+    """Start caching an event's video in the background; best effort, it never fails the request."""
+    try:
+        _schedule_event_video_prewarm(app, account, event)
+    except Exception:
+        logger.warning("Could not schedule video pre-caching for a safety event", exc_info=True)
+
+
+def _schedule_event_video_prewarm(app: web.Application, account, event: dict) -> None:
     core = app["core"]
     vehicle_id = event_vehicle_id(core, event)
     event_id = core.event_id(event)
